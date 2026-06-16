@@ -1,0 +1,11 @@
+[theme]
+base = "dark"
+
+[server]
+maxUploadSize = 500
+maxMessageSize = 500
+enableCORS = false
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false

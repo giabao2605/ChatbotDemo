@@ -1,0 +1,33 @@
+# Environments
+chat_env/
+venv/
+env/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Databases & Media
+Mechanical_Qdrant_DB/
+Data_Anh_Da_Tach/
+Data_Goc/
+
+# Logs & Temp
+logs/
+temp_logs/
+*.log
+!requirements.txt
+
+# Secrets
+.env
+
+# Debug & Temp scripts (không commit)
+debug*.py
+debug*.txt
+temp_*.py
+temp_*.txt
+plot.log
+
+# IDE & OS
+.vscode/
+.idea/
+Thumbs.db

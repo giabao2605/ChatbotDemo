@@ -132,7 +132,7 @@ def get_all_sessions():
                     SELECT SessionID,
                            CauHoi_User AS CauHoiDauTien,
                            ThoiGian AS ThoiGianBatDau,
-                           ROW_NUMBER() OVER (PARTITION BY SessionID ORDER BY ThoiGian ASC) AS rn
+                           ROW_NUMBER() OVER (PARTITION BY SessionID ORDER BY ThoiGian ASC, ChatID ASC) AS rn
                     FROM LichSuChat
                 ) t
                 WHERE rn = 1
@@ -163,7 +163,7 @@ def get_chat_history(session_id):
                 SELECT ChatID, CauHoi_User, TraLoi_Bot, HinhAnhUpload, DanhGia, RefImages
                 FROM LichSuChat
                 WHERE SessionID = :session_id
-                ORDER BY ThoiGian ASC
+                ORDER BY ThoiGian ASC, ChatID ASC
                 """
             )
             rows = conn.execute(query, {"session_id": session_id}).fetchall()

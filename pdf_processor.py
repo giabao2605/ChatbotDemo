@@ -1,5 +1,6 @@
 import os
 import fitz
+import unicodedata
 import re
 import time
 import json
@@ -19,6 +20,17 @@ from rag_logic import vectorstore, client
 # FIX Bug #4: predicate retry dung chung cho Gemini (google-genai)
 from gemini_client import is_retryable_error
 from functools import lru_cache
+
+def remove_accents(text: str) -> str:
+    if text is None:
+        return ""
+    text = str(text)
+    text = text.replace("đ", "d").replace("Đ", "D")
+    normalized = unicodedata.normalize("NFD", text)
+    return "".join(
+        ch for ch in normalized
+        if unicodedata.category(ch) != "Mn"
+    )
  
 # FIX H5: Cache word_tokenize (underthesea cham 50-200ms/call). Header / chunk lap lai khong tokenize lai.
 @lru_cache(maxsize=4096)
@@ -102,50 +114,46 @@ def extract_metadata_smart(text, ten_file, thu_muc, vision_model=None):
     """
     lines = text.split('\n')
  
-    ma_tp_val = "Khong ro"
-    file_tp_match = re.search(r'(9\.3\.\d{4,5})', ten_file)
-    if file_tp_match:
-        ma_tp_val = file_tp_match.group(1)
-    if ma_tp_val == "Khong ro":
-        for line in lines:
-            line_stripped = line.strip()
-            if re.match(r'^9\.3\.\d{4,5}$', line_stripped):
-                ma_tp_val = line_stripped
-                break
- 
-    ma_btp_val = "Khong ro"
+    ma_doi_tuong_regex = []
+    code_patterns = [
+        r"\b\d{1,2}\.\d{1,2}\.\d{3,6}(?:\.\d{1,4})?\b",
+        r"\b[A-Z]{1,5}[-_/]?\d{3,8}(?:[-_/][A-Z0-9]+)?\b",
+    ]
+    
+    for pat in code_patterns:
+        for m in re.findall(pat, ten_file):
+            if m not in ma_doi_tuong_regex:
+                ma_doi_tuong_regex.append(m)
+
     ten_sp_val = "Khong ro"
-    ma_btp_line_idx = -1
-    for idx, line in enumerate(lines):
-        line_stripped = line.strip()
-        if re.match(r'^8\.3\.\d{4,5}\.\d{2,3}$', line_stripped):
-            if ma_btp_val == "Khong ro":
-                ma_btp_val = line_stripped
-                ma_btp_line_idx = idx
-                break
- 
-    if ma_btp_line_idx >= 0 and ma_btp_line_idx + 1 < len(lines):
-        ten_sp_parts = []
-        for j in range(ma_btp_line_idx + 1, min(ma_btp_line_idx + 3, len(lines))):
-            next_line = lines[j].strip()
-            if next_line.startswith("Ban ve") or next_line == "" or next_line == "-":
-                break
-            ten_sp_parts.append(next_line)
-        if ten_sp_parts:
-            ten_sp_val = " ".join(ten_sp_parts)
- 
     vat_lieu_val = "Khong ro"
+    
     for idx, line in enumerate(lines):
         line_stripped = line.strip()
-        if re.match(r'^Inox\s+\d{3}', line_stripped):
-            vat_lieu_val = line_stripped
-            break
- 
+        
+        for pat in code_patterns:
+            for m in re.findall(pat, line_stripped):
+                if m not in ma_doi_tuong_regex:
+                    ma_doi_tuong_regex.append(m)
+                    if ten_sp_val == "Khong ro" and idx + 1 < len(lines):
+                        ten_sp_parts = []
+                        for j in range(idx + 1, min(idx + 3, len(lines))):
+                            next_line = lines[j].strip()
+                            if next_line.startswith("Ban ve") or next_line == "" or next_line == "-":
+                                break
+                            ten_sp_parts.append(next_line)
+                        if ten_sp_parts:
+                            ten_sp_val = " ".join(ten_sp_parts)
+                            
+        if re.match(r'^(?:Inox|SUS|SS|AL|Thep|SPCC|Q235|Nhom|Dong|Sat)', line_stripped, re.IGNORECASE):
+            if vat_lieu_val == "Khong ro":
+                vat_lieu_val = line_stripped
+
     so_luong_val = "Khong ro"
     found_vat_lieu = False
     for idx, line in enumerate(lines):
         line_stripped = line.strip()
-        if re.match(r'^Inox\s+\d{3}', line_stripped):
+        if re.match(r'^(?:Inox|SUS|SS|AL|Thep|SPCC|Q235|Nhom|Dong|Sat)', line_stripped, re.IGNORECASE):
             found_vat_lieu = True
             continue
         if found_vat_lieu and re.match(r'^\d{1,3}$', line_stripped):
@@ -218,13 +226,6 @@ def extract_metadata_smart(text, ten_file, thu_muc, vision_model=None):
     elif re.search(r'(\d{2,4}\s*[xX]\s*\d{2,4}\s*[xX]\s*\d{2,4})\s*mm', text):
         kich_thuoc_val = re.search(r'(\d{2,4}\s*[xX]\s*\d{2,4}\s*[xX]\s*\d{2,4})\s*mm', text).group(1) + "mm"
  
-    # Tao mang ma mac dinh tu Regex neu co
-    ma_doi_tuong_regex = []
-    if ma_tp_val != "Khong ro":
-        ma_doi_tuong_regex.append(ma_tp_val)
-    if ma_btp_val != "Khong ro":
-        ma_doi_tuong_regex.append(ma_btp_val)
- 
     result = {
         "ma_doi_tuong": ma_doi_tuong_regex,
         "ten_tai_lieu": ten_sp_val,
@@ -236,15 +237,21 @@ def extract_metadata_smart(text, ten_file, thu_muc, vision_model=None):
     }
  
     # HYBRID APPROACH: LLM Extraction de doc moi ma (V2)
-    # BO QUA GOI GEMINI neu Regex da bat duoc ma hop le de tiet kiem thoi gian & API
-    has_valid_regex_id = len(result.get("ma_doi_tuong", [])) > 0
-    if vision_model and not has_valid_regex_id:
+    # KHONG BO QUA GOI GEMINI: Cho phep Gemini bo sung hoac sua ma tu Regex
+    if vision_model:
         prompt = f"""
         Ban la chuyen gia doc tai lieu co khi. Hay trich xuat cac thong tin sau tu doan text, tra ve dung dinh dang JSON:
             "ma_doi_tuong": ["ma 1", "ma 2"],
             "ten_tai_lieu": "Ten san pham hoac tieu de tai lieu",
             "loai_tai_lieu": "Nhan ngan gon mo ta tai lieu (VD: Ban ve gia cong, So tay ISO, Catalog...)",
             "vat_lieu": "Vat lieu de cap (neu co)"
+            
+        Goi y cac thong tin so bo da tim thay (hay kiem tra, mo rong hoac sua lai neu can):
+        - Ma doi tuong: {result.get("ma_doi_tuong", [])}
+        - Ten tai lieu: {result.get("ten_tai_lieu")}
+        - Vat lieu: {result.get("vat_lieu")}
+        
+        Uu tien ket qua phan tich cua ban neu hop ly hon. Luu y: Chi tra ve dung JSON, khong giai thich gi them.
         Text can phan tich:
         {text}
         """
@@ -455,8 +462,45 @@ def process_and_ingest_pdf(pdf_path, ten_file, thu_muc, vision_model=None, progr
             try:
                 page = doc.load_page(page_num)
                 text = page.get_text("text")
-                info = extract_metadata_smart(text, ten_file, thu_muc, vision_model)
- 
+
+                # Render image truoc de kip phan tich
+                pix = page.get_pixmap(dpi=200)
+                safe_thu_muc = re.sub(r'[\\/*?:"<>|]', "", thu_muc) if thu_muc else ""
+                if safe_thu_muc:
+                    img_name = f"{safe_thu_muc}_{base_name}_page{page_num+1}.png"
+                else:
+                    img_name = f"{base_name}_page{page_num+1}.png"
+                img_path = os.path.join(IMAGE_DIR, img_name)
+                pix.save(img_path)
+
+                image_summary = ""
+                is_pure_drawing = len(text.strip()) < 200  # Tang nguong tu 50 len 200 (Fix Bug #10)
+                
+                # So bo lay ID bang regex tu text goc de xem co ma khong (tiet kiem API)
+                temp_info = extract_metadata_smart(text, ten_file, thu_muc, None)
+                has_valid_id = len(temp_info.get("ma_doi_tuong", [])) > 0
+
+                # CHI GOI GEMINI VISION KHI: Trang khong co ma HOAC la ban ve thuan (it text)
+                if vision_model and os.path.exists(img_path) and (not has_valid_id or is_pure_drawing):
+                    if progress_callback:
+                        progress_callback(f"Dang dung AI (Gemini) phan tich anh trang {page_num+1}...")
+                    try:
+                        img_to_analyze = Image.open(img_path)
+                        prompt = (
+                            f"Day la trang so {page_num+1} cua file {ten_file}. "
+                            f"Hay mo ta chi tiet nhung gi ban thay trong hinh anh nay: "
+                            f"hinh dang linh kien, cac goc nhin mat cat, ghi chu ky thuat, cac thong so/kich thuoc quan trong, "
+                            f"hoac so do huong dan cong viec neu co. "
+                            f"Mo ta cua ban se duoc dung de tra cuu RAG, vi vay hay trich xuat bat ky thong tin nao huu ich. Tra loi bang tieng Viet."
+                        )
+                        response = call_gemini_vision(vision_model, prompt, img_to_analyze)
+                        image_summary = response.text
+                    except Exception as e:
+                        logger.error(f"Loi khi dung Gemini phan tich {img_name}: {e}")
+
+                combined_text_for_metadata = text + "\n\n" + image_summary
+                info = extract_metadata_smart(combined_text_for_metadata, ten_file, thu_muc, vision_model)
+
                 metadata = {
                     "file_goc": ten_file,
                     "phong_ban_quyen": thu_muc,
@@ -477,37 +521,6 @@ def process_and_ingest_pdf(pdf_path, ten_file, thu_muc, vision_model=None, progr
  
                 # FIX #1: CHI insert metadata trang nay (khong xoa metadata cac trang khac)
                 save_page_metadata(ten_file, thu_muc, info, doc_id=doc_id)
- 
-                pix = page.get_pixmap(dpi=200)
-                safe_thu_muc = re.sub(r'[\\/*?:"<>|]', "", thu_muc) if thu_muc else ""
-                if safe_thu_muc:
-                    img_name = f"{safe_thu_muc}_{base_name}_page{page_num+1}.png"
-                else:
-                    img_name = f"{base_name}_page{page_num+1}.png"
-                img_path = os.path.join(IMAGE_DIR, img_name)
-                pix.save(img_path)
- 
-                image_summary = ""
-                has_valid_id = len(info.get("ma_doi_tuong", [])) > 0
-                is_pure_drawing = len(text.strip()) < 200  # Tang nguong tu 50 len 200 (Fix Bug #10)
-                # CHI GOI GEMINI VISION KHI: Trang khong co ma HOAC la ban ve thuan (it text)
-                if vision_model and os.path.exists(img_path) and (not has_valid_id or is_pure_drawing):
-                    if progress_callback:
-                        progress_callback(f"Dang dung AI (Gemini) phan tich anh trang {page_num+1}...")
-                    try:
-                        img_to_analyze = Image.open(img_path)
-                        prompt = (
-                            f"Day la trang so {page_num+1} cua {info['loai_tai_lieu']}. "
-                            f"Ma so: {info['ma_doi_tuong']}, Tieu de: {info['ten_tai_lieu']}. "
-                            f"Hay mo ta chi tiet nhung gi ban thay trong hinh anh nay: "
-                            f"hinh dang linh kien, cac goc nhin mat cat, ghi chu ky thuat, cac thong so/kich thuoc quan trong, "
-                            f"hoac so do huong dan cong viec neu co. "
-                            f"Mo ta cua ban se duoc dung de tra cuu RAG, vi vay hay trich xuat bat ky thong tin nao huu ich. Tra loi bang tieng Viet."
-                        )
-                        response = call_gemini_vision(vision_model, prompt, img_to_analyze)
-                        image_summary = response.text
-                    except Exception as e:
-                        logger.error(f"Loi khi dung Gemini phan tich {img_name}: {e}")
  
                 all_chunks = []
                 title_block = (
@@ -582,11 +595,13 @@ def process_and_ingest_pdf(pdf_path, ten_file, thu_muc, vision_model=None, progr
                         client.delete(
                             collection_name="TaiLieuKyThuat_v2",
                             points_selector=models.Filter(must=[
-                                models.FieldCondition(key="metadata.file_goc", match=models.MatchValue(value=ten_file))
+                                models.FieldCondition(key="metadata.file_goc", match=models.MatchValue(value=ten_file)),
+                                models.FieldCondition(key="metadata.phong_ban_quyen", match=models.MatchValue(value=thu_muc))
                             ])
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.error(f"Khong xoa duoc vector cu cua {ten_file}: {e}", exc_info=True)
+                        raise
  
                 vectorstore.add_documents(all_chunks)
                 report["total_chunks"] += len(all_chunks)
@@ -728,11 +743,13 @@ def process_and_ingest_file(file_path, ten_file, thu_muc, vision_model=None, pro
                 client.delete(
                     collection_name="TaiLieuKyThuat_v2",
                     points_selector=models.Filter(must=[
-                        models.FieldCondition(key="metadata.file_goc", match=models.MatchValue(value=ten_file))
+                        models.FieldCondition(key="metadata.file_goc", match=models.MatchValue(value=ten_file)),
+                        models.FieldCondition(key="metadata.phong_ban_quyen", match=models.MatchValue(value=thu_muc))
                     ])
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Khong xoa duoc vector cu cua {ten_file}: {e}", exc_info=True)
+                raise
  
             vectorstore.add_documents(all_chunks)
             report["total_chunks"] += len(all_chunks)

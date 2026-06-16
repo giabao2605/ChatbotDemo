@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import re
 import tempfile
 import uuid
 import time
@@ -13,11 +14,11 @@ from rag_logic import chat_with_rag
 from db_logic import save_chat_history, clear_chat_history, update_chat_feedback, get_all_sessions, get_chat_history
 from file_learning import SUPPORTED_LEARNING_EXTENSIONS, learn_new_file
 from datetime import date, timedelta
+from pdf_processor import remove_accents
  
 IMAGE_QUESTION_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
 LEARNING_COMMAND_KEYWORDS = (
-    "hoc", "hoc", "nap", "nap", "learn", "luu", "luu",
-    "them du lieu", "them du lieu", "kien thuc", "kien thuc",
+    "hoc", "nap", "learn", "luu", "them du lieu", "kien thuc",
 )
 UPLOAD_FILE_TYPES = sorted(ext.lstrip(".") for ext in SUPPORTED_LEARNING_EXTENSIONS)
  
@@ -77,6 +78,11 @@ with st.sidebar:
         st.session_state.chat_history = []
         st.session_state.current_part_ids = []
         st.rerun()
+
+    if st.session_state.current_part_ids:
+        if st.button("Xoa ngu canh ma hien tai", width="stretch"):
+            st.session_state.current_part_ids = []
+            st.rerun()
  
     st.markdown("<br>", unsafe_allow_html=True)
  
@@ -231,7 +237,7 @@ if submission := st.chat_input("Nhap cau hoi ky thuat can tra cuu...", accept_fi
     uploaded_files = submission.files if submission.files else []
  
     # Kiem tra xem user upload file tai lieu (yeu cau hoc) hay upload anh (hoi RAG)
-    prompt_lower = prompt.lower()
+    prompt_lower = remove_accents(prompt.lower())
     has_learning_keyword = any(keyword in prompt_lower for keyword in LEARNING_COMMAND_KEYWORDS)
  
     is_learning_batch = False
@@ -265,7 +271,8 @@ if submission := st.chat_input("Nhap cau hoi ky thuat can tra cuu...", accept_fi
  
                 for idx, uf in enumerate(uploaded_files):
                     st.write(f"---\n**⏳ [{idx+1}/{len(uploaded_files)}] Dang xu ly: {uf.name}**")
-                    safe_original_name = uf.name
+                    raw_name = os.path.basename(uf.name)
+                    safe_original_name = re.sub(r'[\\/*?:"<>|]', "_", raw_name)[:180]
                     # Them idx vao timestamp de dam bao file luu xuong khong bao gio bi trung ten vat ly
                     safe_filename = f"{int(time.time())}_{idx}_{safe_original_name}"
                     file_path = os.path.join(tu_hoc_dir, safe_filename)
@@ -375,13 +382,18 @@ if submission := st.chat_input("Nhap cau hoi ky thuat can tra cuu...", accept_fi
                 raw_chunks = []
  
                 def generate_response():
-                    for chunk in stream:
-                        raw_chunks.append(chunk)
-                        # Fix loi the < lam mat doan text dang sau trong markdown
-                        yield chunk.replace("<", "&lt;")
- 
-                    if ref_text:
-                        yield ref_text.replace("<", "&lt;")
+                    try:
+                        for chunk in stream:
+                            raw_chunks.append(chunk)
+                            # Fix loi the < lam mat doan text dang sau trong markdown
+                            yield chunk.replace("<", "&lt;")
+     
+                        if ref_text:
+                            yield ref_text.replace("<", "&lt;")
+                    except Exception as e:
+                        from logger_config import logger
+                        logger.error(f"Loi streaming response: {e}", exc_info=True)
+                        yield "\n\nXin loi, he thong gap loi khi sinh cau tra loi. Vui long thu lai."
  
                 st.write_stream(generate_response)
  
@@ -410,7 +422,6 @@ if submission := st.chat_input("Nhap cau hoi ky thuat can tra cuu...", accept_fi
         st.session_state.chat_history.append({
             "role": "assistant",
             "content": raw_response,
-            "image": saved_img_path,
             "ref_images": ref_images,
             "chat_id": chat_id
         })

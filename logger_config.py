@@ -28,3 +28,35 @@ if not logger.handlers:
     
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
+
+# --- OBSERVABILITY / TRACING ---
+import json
+from datetime import datetime, timezone
+
+trace_log_file = os.path.join(log_dir, 'rag_trace.jsonl')
+trace_logger = logging.getLogger("RagTrace")
+trace_logger.setLevel(logging.INFO)
+
+if not trace_logger.handlers:
+    trace_handler = RotatingFileHandler(
+        trace_log_file, maxBytes=20*1024*1024, backupCount=5, encoding='utf-8'
+    )
+    # Jsonl không cần formatter có asctime text, chỉ ghi message (chứa chuỗi json)
+    trace_handler.setFormatter(logging.Formatter('%(message)s'))
+    trace_logger.addHandler(trace_handler)
+    
+def log_trace(event_name, trace_id, **kwargs):
+    """
+    Ghi một event JSONL vào log trace.
+    Mỗi event nên chứa it nhat: event_name, trace_id, cac metric khac truyen qua kwargs.
+    """
+    try:
+        event = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": event_name,
+            "trace_id": trace_id
+        }
+        event.update(kwargs)
+        trace_logger.info(json.dumps(event, ensure_ascii=False))
+    except Exception as e:
+        logger.error(f"Loi khi ghi trace log {event_name}: {e}")

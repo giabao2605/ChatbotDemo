@@ -6,6 +6,7 @@ import re
 import warnings
 import time
 import uuid
+from datetime import datetime
  
 # Tat toan bo canh bao rac
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
@@ -14,7 +15,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 from dotenv import load_dotenv
 load_dotenv()
  
-from logger_config import logger
+from logger_config import logger, log_trace
 from PIL import Image
 import underthesea
 from qdrant_client import QdrantClient, models
@@ -105,6 +106,10 @@ class RAGSystem:
             "metadata.file_goc": models.PayloadSchemaType.KEYWORD,
             "metadata.phong_ban_quyen": models.PayloadSchemaType.KEYWORD,
             "metadata.ma_doi_tuong": models.PayloadSchemaType.KEYWORD,
+            "metadata.ma_chinh": models.PayloadSchemaType.KEYWORD,
+            "metadata.ma_btp": models.PayloadSchemaType.KEYWORD,
+            "metadata.ma_vat_tu": models.PayloadSchemaType.KEYWORD,
+            "metadata.ma_lien_quan": models.PayloadSchemaType.KEYWORD,
             "metadata.loai_du_lieu": models.PayloadSchemaType.KEYWORD,
         }
         
@@ -212,17 +217,30 @@ def format_docs(docs):
         # FIX: metadata thuc te luu ma o 'ma_doi_tuong' (list), khong phai ma_thanh_pham/ma_ban_thanh_pham
         # -> truoc day header luon ra 'CHUNG'. Gio doc dung key.
         ma_doi_tuong = doc.metadata.get('ma_doi_tuong', [])
-        if isinstance(ma_doi_tuong, (list, tuple)):
-            ma_str = ", ".join(str(m) for m in ma_doi_tuong if m and str(m) != "Khong ro")
-        else:
-            ma_str = str(ma_doi_tuong) if ma_doi_tuong and str(ma_doi_tuong) != "Khong ro" else ""
- 
+        ma_chinh = doc.metadata.get('ma_chinh', [])
+        ma_btp = doc.metadata.get('ma_btp', [])
+        ma_vat_tu = doc.metadata.get('ma_vat_tu', [])
+        
         # DAT MA LEN DAU DE LLM DE PHAN BIET KHI SO SANH CHEO
-        header = "[TAI LIEU "
-        if ma_str:
-            header += f"MA {ma_str}"
+        header = "[TAI LIEU"
+        
+        if ma_chinh:
+            ma_chinh_str = ", ".join(str(m) for m in ma_chinh if m and str(m) != "Khong ro") if isinstance(ma_chinh, list) else str(ma_chinh)
+            header += f" | MA CHINH: {ma_chinh_str}"
+        elif ma_doi_tuong:
+            ma_str = ", ".join(str(m) for m in ma_doi_tuong if m and str(m) != "Khong ro") if isinstance(ma_doi_tuong, list) else str(ma_doi_tuong)
+            header += f" | MA: {ma_str}"
         else:
-            header += "CHUNG"
+            header += " CHUNG"
+            
+        if ma_btp:
+            ma_btp_str = ", ".join(str(m) for m in ma_btp if m and str(m) != "Khong ro") if isinstance(ma_btp, list) else str(ma_btp)
+            header += f" | BTP: {ma_btp_str}"
+            
+        if ma_vat_tu:
+            ma_vat_tu_str = ", ".join(str(m) for m in ma_vat_tu if m and str(m) != "Khong ro") if isinstance(ma_vat_tu, list) else str(ma_vat_tu)
+            header += f" | VAT TU: {ma_vat_tu_str}"
+            
         header += "]\n"
  
         header += f"- Nguon: {source_file} (Trang {trang}) | Cong doan: {cong_doan} | Phan loai: {loai}\n"
@@ -326,19 +344,39 @@ def extract_search_intent(question, current_part_ids=None):
     if not new_part_ids:
         # Return filter only with published
         qdrant_filter = models.Filter(must=[published_condition])
-        return qdrant_filter, [], True
+        return qdrant_filter, qdrant_filter, new_part_ids, is_inherited, False
  
-    # Dung MatchAny cho truong array metadata.ma_doi_tuong, kết hợp với published
-    qdrant_filter = models.Filter(
-        must=[published_condition],
-        should=[
+    from pdf_processor import remove_accents
+    q_norm = remove_accents(question.lower())
+    is_bom_query = any(kw in q_norm for kw in ["vat tu", "bang ke", "bom", "danh sach", "chi tiet", "gom nhung gi", "cau tao", "linh kien", "part list", "thanh phan", "chi tiet con", "vat lieu", "cum nay", "ma nao"])
+
+    # Buoc 1: Strict filter (Chi tim theo ma_chinh)
+    strict_filter = models.Filter(
+        must=[
+            published_condition,
             models.FieldCondition(
-                key="metadata.ma_doi_tuong",
+                key="metadata.ma_chinh",
                 match=models.MatchAny(any=new_part_ids)
             )
         ]
     )
-    return qdrant_filter, new_part_ids, is_inherited
+
+    # Buoc 2: Broad filter (Mo rong ra cac field khac)
+    broad_should_conditions = [
+        models.FieldCondition(key="metadata.ma_chinh", match=models.MatchAny(any=new_part_ids)),
+        models.FieldCondition(key="metadata.ma_btp", match=models.MatchAny(any=new_part_ids)),
+        models.FieldCondition(key="metadata.ma_vat_tu", match=models.MatchAny(any=new_part_ids)),
+        models.FieldCondition(key="metadata.ma_lien_quan", match=models.MatchAny(any=new_part_ids)),
+        # Fallback for backward compatibility
+        models.FieldCondition(key="metadata.ma_doi_tuong", match=models.MatchAny(any=new_part_ids))
+    ]
+
+    broad_filter = models.Filter(
+        must=[published_condition],
+        should=broad_should_conditions
+    )
+    
+    return strict_filter, broad_filter, new_part_ids, is_inherited, is_bom_query
  
 def rerank_docs(docs):
     priority = {
@@ -541,7 +579,17 @@ def has_unsupported_numbers(answer, context_text, question):
 def chat_with_rag(user_question, image_path=None, chat_history=None, current_part_ids=None):
     if chat_history is None:
         chat_history = []
- 
+        
+    trace_id = f"rag_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    t_start = time.time()
+    
+    log_trace("rag_start", trace_id, 
+              question=user_question[:500],
+              has_image=bool(image_path),
+              history_count=len(chat_history),
+              current_part_ids=current_part_ids,
+              model=os.getenv("COHERE_MODEL_NAME", "command-r-08-2024"))
+
     # Tao chuoi lich su (Token-Budgeted Windowing) de nap vao prompt cho mach lac hoi thoai
     # FIX HOI THOAI DAI: Thay vi co dinh 4 message (bot response dai chiem hang ngan token,
     # lan at context tai lieu khien LLM tra loi kem), dung budget ky tu co dinh.
@@ -570,6 +618,7 @@ def chat_with_rag(user_question, image_path=None, chat_history=None, current_par
     # BUOC A: XU LY ANH BANG GEMINI
     image_analysis = ""
     if image_path:
+        t_img_start = time.time()
         logger.info("Dang dung Gemini de phan tich anh tai len...")
         if _VISION_MODEL:
             try:
@@ -587,10 +636,23 @@ def chat_with_rag(user_question, image_path=None, chat_history=None, current_par
                 response = call_gemini()
                 image_analysis = response.text
                 logger.info("Phan tich anh bang Gemini thanh cong.")
+                
+                log_trace("image_analysis", trace_id, 
+                          latency_ms=int((time.time() - t_img_start)*1000),
+                          success=True,
+                          analysis_chars=len(image_analysis))
             except Exception as e:
                 logger.error(f"Loi khi doc anh bang Gemini: {e}", exc_info=True)
+                log_trace("image_analysis", trace_id, 
+                          latency_ms=int((time.time() - t_img_start)*1000),
+                          success=False,
+                          error=str(e))
         else:
             logger.warning("Chua co API Key Gemini hop le, bo qua phan tich anh.")
+            log_trace("image_analysis", trace_id, 
+                      latency_ms=int((time.time() - t_img_start)*1000),
+                      success=False,
+                      reason="no_vision_model")
  
     # BUOC B: TIM KIEM THONG MINH KET HOP STATE MEMORY
     from pdf_processor import remove_accents
@@ -607,10 +669,18 @@ def chat_with_rag(user_question, image_path=None, chat_history=None, current_par
 
     if is_chitchat:
         logger.info("Cau hoi la giao tiep co ban, bo qua truy xuat DB.")
+        log_trace("rag_end", trace_id, final_latency_ms=int((time.time() - t_start)*1000), refusal=False, is_chitchat=True)
         return mock_stream(), "", [], current_part_ids
     else:
         logger.info("Dang phan tich intent de tim kiem du lieu...")
-        qdrant_filter, new_part_ids, is_inherited = extract_search_intent(user_question, current_part_ids)
+        t_intent = time.time()
+        strict_filter, broad_filter, new_part_ids, is_inherited, is_bom_query = extract_search_intent(user_question, current_part_ids)
+        
+        log_trace("intent", trace_id, 
+                  latency_ms=int((time.time() - t_intent)*1000),
+                  part_ids=new_part_ids,
+                  is_inherited=is_inherited,
+                  is_bom_query=is_bom_query)
  
         if new_part_ids == ["CHITCHAT"]:
             logger.info("LLM xac nhan la cau hoi ngoai le/xa giao. Bo qua toan bo Retrieval va HyDE.")
@@ -621,27 +691,29 @@ def chat_with_rag(user_question, image_path=None, chat_history=None, current_par
             query_to_search = tokenized_question
  
             # HyDE (Hypothetical Document Embeddings) Trigger
-            # TOI UU SIEU TOC: Chi bat HyDE neu KHONG CO ma ban ve cu the. Neu da co ma, BM25 du suc tim ra.
-            # Nang nguong tu 15 len 25 tu de phu hop hon voi tieng Viet (Fix Bug #11)
             if len(tokenized_question.split()) < 25 and not new_part_ids:
                 logger.info("Cau hoi ngan VA khong co ma ban ve, kich hoat HyDE de mo rong ngu canh...")
                 try:
-                    # HumanMessage da duoc import o dau file
                     hyde_prompt = f"Viet mot doan van ban ky thuat ngan gon (1-2 cau) tra loi cho cau hoi sau trong linh vuc gia cong co khi: '{user_question}'"
+                    t_hyde = time.time()
                     hyde_response = cohere_invoke([HumanMessage(content=hyde_prompt)]).content
                     query_to_search = tokenize_cached(hyde_response)
+                    log_trace("hyde", trace_id, latency_ms=int((time.time() - t_hyde)*1000), used=True, hyde_chars=len(hyde_response))
                 except Exception as e:
                     logger.warning(f"Loi HyDE: {e}")
+                    log_trace("hyde", trace_id, used=True, error=str(e))
  
-            if new_part_ids and qdrant_filter:
+            t_retrieval = time.time()
+            retrieval_mode = "unknown"
+            if new_part_ids:
                 if is_inherited:
-                    # FIX HOI THOAI DAI: State ke thua tu luot truoc - user co the da doi chu de.
-                    # Tim SONG SONG: theo filter cu + toan DB, gop ket qua de Rerank quyet dinh.
-                    logger.info(f"State ke thua ({new_part_ids}). Dual search: filtered + unfiltered...")
+                    # FIX HOI THOAI DAI: State ke thua tu luot truoc
+                    logger.info(f"State ke thua ({new_part_ids}). Dual search: strict filtered + unfiltered...")
+                    retrieval_mode = "dual_search"
                     try:
                         ret_filtered = vectorstore.as_retriever(
                             search_type="similarity",
-                            search_kwargs={"k": 8, "filter": qdrant_filter}
+                            search_kwargs={"k": 8, "filter": strict_filter}
                         )
                         base_filter = models.Filter(must=[models.FieldCondition(key="metadata.doc_status", match=models.MatchValue(value="published"))])
                         ret_unfiltered = vectorstore.as_retriever(
@@ -650,7 +722,7 @@ def chat_with_rag(user_question, image_path=None, chat_history=None, current_par
                         )
                         docs_f = ret_filtered.invoke(query_to_search)
                         docs_u = ret_unfiltered.invoke(query_to_search)
-                        # Merge + deduplicate (uu tien filtered truoc)
+                        # Merge + deduplicate
                         seen = set()
                         for doc in docs_f + docs_u:
                             key = doc.page_content[:200]
@@ -660,40 +732,78 @@ def chat_with_rag(user_question, image_path=None, chat_history=None, current_par
                     except Exception as e:
                         logger.warning(f"Dual retrieval that bai: {e}")
                 else:
-                    # MA MOI DUOC TRICH XUAT: Tim chinh xac theo filter
+                    # MA MOI DUOC TRICH XUAT: Two-step retrieval
                     base_k = 15 * len(new_part_ids)
-                    logger.info(f"Dang truy xuat cho cac ma: {new_part_ids} (k={base_k})...")
-                    try:
-                        retriever = vectorstore.as_retriever(
-                            search_type="similarity",
-                            search_kwargs={"k": base_k, "filter": qdrant_filter}
-                        )
-                        retrieved_docs = retriever.invoke(query_to_search)
-                    except Exception as e:
-                        logger.warning(f"Retrieval that bai cho cac ma {new_part_ids}: {e}")
+                    retrieval_mode = "strict"
+                    
+                    if not is_bom_query:
+                        logger.info(f"Step 1: Dang truy xuat CHINH XAC cho ma chinh: {new_part_ids} (k={base_k})...")
+                        try:
+                            retriever_strict = vectorstore.as_retriever(
+                                search_type="similarity",
+                                search_kwargs={"k": base_k, "filter": strict_filter}
+                            )
+                            retrieved_docs = retriever_strict.invoke(query_to_search)
+                        except Exception as e:
+                            logger.warning(f"Strict retrieval that bai: {e}")
+                            
+                    # Neu khong co ket qua tu ma_chinh HOAC day la cau hoi ve BOM -> mo rong tim kiem
+                    if not retrieved_docs or is_bom_query:
+                        retrieval_mode = "broad"
+                        logger.info(f"Step 2: Khong du ket qua hoac hoi BOM, mo rong truy xuat cho cac ma: {new_part_ids}...")
+                        try:
+                            retriever_broad = vectorstore.as_retriever(
+                                search_type="similarity",
+                                search_kwargs={"k": base_k * 2, "filter": broad_filter}
+                            )
+                            broad_docs = retriever_broad.invoke(query_to_search)
+                            
+                            # Merge and deduplicate
+                            existing_docs = retrieved_docs
+                            merged_docs = []
+                            seen = set()
+                            for doc in existing_docs + broad_docs:
+                                key = doc.page_content[:200]
+                                if key not in seen:
+                                    seen.add(key)
+                                    merged_docs.append(doc)
+                            retrieved_docs = merged_docs
+                        except Exception as e:
+                            logger.warning(f"Broad retrieval that bai: {e}")
             else:
                 # Tim kiem chung neu khong co ma
                 base_k = 30
-                logger.info(f"Khong co ma cu the, dang tim kiem tren toan bo Database (Pure Hybrid Search) k={base_k}...")
+                retrieval_mode = "general"
+                logger.info(f"Khong co ma cu tinh, dang tim kiem tren toan bo Database (Pure Hybrid Search) k={base_k}...")
                 retriever = vectorstore.as_retriever(
                     search_type="similarity",
-                    search_kwargs={"k": base_k, "filter": qdrant_filter}
+                    search_kwargs={"k": base_k, "filter": broad_filter}
                 )
                 retrieved_docs = retriever.invoke(query_to_search)
  
     # Fallback (Thoat trang thai neu tim theo State khong ra ket qua)
     if not skip_retrieval and not retrieved_docs and new_part_ids:
+        retrieval_mode = "fallback"
         logger.info("Cac filter khong tim thay tai lieu nao, thu tim toan bo DB (Fallback)...")
         base_k = 30
         fallback_filter = models.Filter(must=[models.FieldCondition(key="metadata.doc_status", match=models.MatchValue(value="published"))])
         retriever_no_filter = vectorstore.as_retriever(
-            search_type="similarity",  # Hybrid mode dung similarity (Fix Bug #5)
+            search_type="similarity",
             search_kwargs={"k": base_k, "filter": fallback_filter}
         )
         retrieved_docs = retriever_no_filter.invoke(query_to_search)
 
+    if not skip_retrieval:
+        log_trace("retrieval", trace_id, 
+                  latency_ms=int((time.time() - t_retrieval)*1000),
+                  mode=retrieval_mode,
+                  docs_count=len(retrieved_docs),
+                  is_bom_query=is_bom_query if new_part_ids else False,
+                  part_ids=new_part_ids)
+
     # Inject SQL BOM Data
     if not skip_retrieval and new_part_ids:
+        t_sql = time.time()
         try:
             bom_results = search_bom_by_code(new_part_ids)
             if bom_results:
@@ -712,8 +822,12 @@ def chat_with_rag(user_question, image_path=None, chat_history=None, current_par
                 )
                 retrieved_docs.insert(0, bom_doc)
                 logger.info(f"Da them {len(bom_results)} dong BOM tu SQL vao context.")
+                log_trace("sql_bom", trace_id, latency_ms=int((time.time() - t_sql)*1000), rows=len(bom_results), part_ids=new_part_ids)
+            else:
+                log_trace("sql_bom", trace_id, latency_ms=int((time.time() - t_sql)*1000), rows=0, part_ids=new_part_ids)
         except Exception as e:
             logger.error(f"Loi inject SQL BOM: {e}")
+            log_trace("sql_bom", trace_id, latency_ms=int((time.time() - t_sql)*1000), error=str(e), part_ids=new_part_ids)
  
     if image_analysis:
         fake_doc = Document(
@@ -752,6 +866,7 @@ def chat_with_rag(user_question, image_path=None, chat_history=None, current_par
                 compressor = get_reranker(top_n)
  
                 logger.info(f"Dang su dung Cohere Rerank de filter {len(real_docs)} tai lieu (top_n={top_n})...")
+                t_rerank = time.time()
                 compressed_docs = cohere_rerank(compressor, real_docs, user_question)
                 
                 # LOP PHONG THU 1: Score Cutoff
@@ -763,9 +878,13 @@ def chat_with_rag(user_question, image_path=None, chat_history=None, current_par
                     real_docs = compressed_docs[:3]
                 else:
                     real_docs = filtered_docs
+                
+                scores = [{"file": d.metadata.get("file_goc"), "page": d.metadata.get("trang_so"), "score": d.metadata.get("relevance_score", 1.0)} for d in real_docs[:5]]
+                log_trace("rerank", trace_id, latency_ms=int((time.time() - t_rerank)*1000), input_docs=len(retrieved_docs), output_docs=len(real_docs), scores=scores)
             except Exception as e:
                 logger.error(f"Loi khi su dung Cohere Rerank: {e}. Fallback to manual rerank.")
                 real_docs = rerank_docs(real_docs)
+                log_trace("rerank", trace_id, error=str(e))
         else:
             real_docs = rerank_docs(real_docs)
 
@@ -775,6 +894,7 @@ def chat_with_rag(user_question, image_path=None, chat_history=None, current_par
             empty_msg = "Tài liệu hiện tại không ghi chú thông tin về câu hỏi của bạn. Vui lòng kiểm tra lại hoặc cung cấp thêm bản vẽ."
             def mock_stream():
                 yield empty_msg
+            log_trace("rag_end", trace_id, final_latency_ms=int((time.time() - t_start)*1000), refusal=True, refusal_reason="empty_context", docs_count=0)
             return mock_stream(), "", [], new_part_ids
 
         retrieved_docs = fake_docs + real_docs
@@ -789,12 +909,16 @@ def chat_with_rag(user_question, image_path=None, chat_history=None, current_par
     ref_text, ref_images = build_source_citations(retrieved_docs)
 
     # LOP PHONG THU 2: Evidence Gate cho cau hoi bay / cau hoi can so lieu
+    t_gate = time.time()
     answerable, evidence_reason, evidence_quotes = verify_answerability(user_question, context_text)
+    log_trace("evidence_gate", trace_id, latency_ms=int((time.time() - t_gate)*1000), answerable=answerable, reason=evidence_reason)
+    
     if not answerable:
         logger.warning(f"Evidence gate BLOCK cau hoi: {evidence_reason}")
         safe_msg = make_insufficient_evidence_message(user_question, evidence_reason)
         def refusal_stream():
             yield safe_msg
+        log_trace("rag_end", trace_id, final_latency_ms=int((time.time() - t_start)*1000), refusal=True, refusal_reason="evidence_gate", docs_count=len(retrieved_docs))
         return refusal_stream(), ref_text, ref_images, new_part_ids
 
     chain = prompt_template | llm | StrOutputParser()
@@ -809,20 +933,61 @@ def chat_with_rag(user_question, image_path=None, chat_history=None, current_par
         # LOP PHONG THU 3: Post-check so lieu. Voi cau hoi rui ro, tam hoan streaming de kiem tra
         # LLM co tu tao so lieu moi (vd 24 gio) khong co trong context/user question hay khong.
         def guarded_stream():
+            t_llm = time.time()
             chunks = []
-            for chunk in chain.stream(stream_input):
-                chunks.append(chunk)
-            answer = "".join(chunks)
-            if has_unsupported_numbers(answer, context_text, user_question):
-                yield make_insufficient_evidence_message(
-                    user_question,
-                    "cau tra loi sinh ra co so lieu khong truy vet duoc trong tai lieu"
-                )
-            else:
-                yield answer
+            has_error = False
+            error_msg = ""
+            try:
+                for chunk in chain.stream(stream_input):
+                    chunks.append(chunk)
+                answer = "".join(chunks)
+                if has_unsupported_numbers(answer, context_text, user_question):
+                    ans = make_insufficient_evidence_message(
+                        user_question,
+                        "cau tra loi sinh ra co so lieu khong truy vet duoc trong tai lieu"
+                    )
+                    yield ans
+                    log_trace("llm_generation", trace_id, model=os.getenv("COHERE_MODEL_NAME", "command-r-08-2024"), latency_ms=int((time.time() - t_llm)*1000), answer_chars=len(ans), blocked_by_post_check=True)
+                    log_trace("rag_end", trace_id, final_latency_ms=int((time.time() - t_start)*1000), refusal=True, refusal_reason="post_check_numbers", docs_count=len(retrieved_docs))
+                else:
+                    yield answer
+                    log_trace("llm_generation", trace_id, model=os.getenv("COHERE_MODEL_NAME", "command-r-08-2024"), latency_ms=int((time.time() - t_llm)*1000), answer_chars=len(answer))
+                    log_trace("rag_end", trace_id, final_latency_ms=int((time.time() - t_start)*1000), refusal=False, docs_count=len(retrieved_docs))
+            except Exception as e:
+                has_error = True
+                error_msg = str(e)
+                logger.error(f"Loi LLM guarded stream: {e}", exc_info=True)
+                raise e
+            finally:
+                if has_error:
+                    log_trace("rag_error", trace_id, error=error_msg, stage="llm_generation")
+                    log_trace("rag_end", trace_id, final_latency_ms=int((time.time() - t_start)*1000), refusal=True, refusal_reason="llm_error", has_error=True)
+
         stream = guarded_stream()
     else:
-        stream = chain.stream(stream_input)
+        def normal_stream():
+            t_llm = time.time()
+            chunks = []
+            has_error = False
+            error_msg = ""
+            try:
+                for chunk in chain.stream(stream_input):
+                    chunks.append(chunk)
+                    yield chunk
+            except Exception as e:
+                has_error = True
+                error_msg = str(e)
+                logger.error(f"Loi LLM stream: {e}", exc_info=True)
+                raise e
+            finally:
+                if has_error:
+                    log_trace("rag_error", trace_id, error=error_msg, stage="llm_generation")
+                    log_trace("rag_end", trace_id, final_latency_ms=int((time.time() - t_start)*1000), refusal=True, refusal_reason="llm_error", has_error=True)
+                else:
+                    answer = "".join(chunks)
+                    log_trace("llm_generation", trace_id, model=os.getenv("COHERE_MODEL_NAME", "command-r-08-2024"), latency_ms=int((time.time() - t_llm)*1000), answer_chars=len(answer))
+                    log_trace("rag_end", trace_id, final_latency_ms=int((time.time() - t_start)*1000), refusal=False, docs_count=len(retrieved_docs))
+        stream = normal_stream()
 
     # BUOC D: TU DONG TAO TRICH DAN NGUON VA HINH ANH (Tra ve cung stream)
     return stream, ref_text, ref_images, new_part_ids

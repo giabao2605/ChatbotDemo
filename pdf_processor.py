@@ -122,8 +122,14 @@ def _metadata_needs_llm(result):
         return False
     if GEMINI_METADATA_MODE == "always":
         return True
+    
     if not result.get("ma_doi_tuong"):
         return True
+        
+    # Neu co nhieu ma nhung chua phan loai duoc BTP/vat tu thi nen goi LLM
+    if len(result.get("ma_doi_tuong", [])) >= 2 and not result.get("ma_btp") and not result.get("ma_vat_tu"):
+        return True
+        
     critical_fields = ("ten_tai_lieu", "loai_tai_lieu", "vat_lieu")
     return any(str(result.get(field) or "").strip() in {"", "Khong ro"} for field in critical_fields)
 
@@ -247,9 +253,26 @@ def extract_metadata_smart(text, ten_file, thu_muc, vision_model=None, quality_w
         kich_thuoc_val = kt_match.group(1).strip()
     elif re.search(r'(\d{2,4}\s*[xX]\s*\d{2,4}\s*[xX]\s*\d{2,4})\s*mm', text):
         kich_thuoc_val = re.search(r'(\d{2,4}\s*[xX]\s*\d{2,4}\s*[xX]\s*\d{2,4})\s*mm', text).group(1) + "mm"
- 
+
+    ma_chinh_regex = []
+    ma_lien_quan_regex = []
+    
+    for m in ma_doi_tuong_regex:
+        if m in ten_file:
+            ma_chinh_regex.append(m)
+        else:
+            ma_lien_quan_regex.append(m)
+            
+    if not ma_chinh_regex and ma_doi_tuong_regex:
+        ma_chinh_regex = [ma_doi_tuong_regex[0]]
+        ma_lien_quan_regex = ma_doi_tuong_regex[1:]
+
     result = {
         "ma_doi_tuong": ma_doi_tuong_regex,
+        "ma_chinh": ma_chinh_regex,
+        "ma_btp": [],
+        "ma_vat_tu": [],
+        "ma_lien_quan": ma_lien_quan_regex,
         "ten_tai_lieu": ten_sp_val,
         "loai_tai_lieu": "Ban ve gia cong",  # Default
         "cong_doan": cong_doan_val, "vat_lieu": vat_lieu_val, "so_luong": so_luong_val,
@@ -263,13 +286,17 @@ def extract_metadata_smart(text, ten_file, thu_muc, vision_model=None, quality_w
     if vision_model and _metadata_needs_llm(result):
         prompt = f"""
         Ban la chuyen gia doc tai lieu co khi. Hay trich xuat cac thong tin sau tu doan text, tra ve dung dinh dang JSON:
-            "ma_doi_tuong": ["ma 1", "ma 2"],
+            "ma_chinh": ["ma 1"],
+            "ma_btp": ["ma 2"],
+            "ma_vat_tu": ["ma 3"],
+            "ma_lien_quan": ["ma 4"],
             "ten_tai_lieu": "Ten san pham hoac tieu de tai lieu",
             "loai_tai_lieu": "Nhan ngan gon mo ta tai lieu (VD: Ban ve gia cong, So tay ISO, Catalog...)",
             "vat_lieu": "Vat lieu de cap (neu co)"
             
         Goi y cac thong tin so bo da tim thay (hay kiem tra, mo rong hoac sua lai neu can):
-        - Ma doi tuong: {result.get("ma_doi_tuong", [])}
+        - Ma chinh: {result.get("ma_chinh", [])}
+        - Ma lien quan: {result.get("ma_lien_quan", [])}
         - Ten tai lieu: {result.get("ten_tai_lieu")}
         - Vat lieu: {result.get("vat_lieu")}
         
@@ -282,14 +309,25 @@ def extract_metadata_smart(text, ten_file, thu_muc, vision_model=None, quality_w
             response = call_gemini_vision(vision_model, prompt)
             raw_json = response.text.replace('```json', '').replace('```', '').strip()
             llm_result = json.loads(raw_json)
-            if "ma_doi_tuong" in llm_result and isinstance(llm_result["ma_doi_tuong"], list) and llm_result["ma_doi_tuong"]:
-                result["ma_doi_tuong"] = [str(x) for x in llm_result["ma_doi_tuong"]]
-            if "ten_tai_lieu" in llm_result and llm_result["ten_tai_lieu"] and llm_result["ten_tai_lieu"] != "Khong ro":
-                result["ten_tai_lieu"] = str(llm_result["ten_tai_lieu"]).strip()
+            
+            for key in ["ma_chinh", "ma_btp", "ma_vat_tu", "ma_lien_quan"]:
+                if key in llm_result and isinstance(llm_result[key], list) and llm_result[key]:
+                    result[key] = [str(x) for x in llm_result[key]]
+                    
+            # Combine all codes to ma_doi_tuong for backward compatibility
+            all_codes = result["ma_chinh"] + result["ma_btp"] + result["ma_vat_tu"] + result["ma_lien_quan"]
+            result["ma_doi_tuong"] = list(dict.fromkeys(all_codes))
+            
+            if "ten_tai_lieu" in llm_result and llm_result["ten_tai_lieu"]:
+                result["ten_tai_lieu"] = str(llm_result["ten_tai_lieu"])
             if "loai_tai_lieu" in llm_result and llm_result["loai_tai_lieu"]:
-                result["loai_tai_lieu"] = str(llm_result["loai_tai_lieu"]).strip()
-            if "vat_lieu" in llm_result and llm_result["vat_lieu"] and llm_result["vat_lieu"] != "Khong ro":
-                result["vat_lieu"] = str(llm_result["vat_lieu"]).strip()
+                result["loai_tai_lieu"] = str(llm_result["loai_tai_lieu"])
+            if "vat_lieu" in llm_result and llm_result["vat_lieu"]:
+                result["vat_lieu"] = str(llm_result["vat_lieu"])
+            if "quality_warnings" in llm_result and isinstance(llm_result["quality_warnings"], list) and quality_warnings is not None:
+                for w in llm_result["quality_warnings"]:
+                    if w not in quality_warnings:
+                        quality_warnings.append(str(w))
         except Exception as e:
             detail = describe_gemini_error(e)
             msg = f"Loi LLM Fallback boc tach metadata cho {ten_file}: {detail}"
@@ -713,6 +751,10 @@ def process_and_ingest_pdf(pdf_path, ten_file, thu_muc, vision_model=None, progr
                     "file_goc": ten_file,
                     "phong_ban_quyen": thu_muc,
                     "ma_doi_tuong": info["ma_doi_tuong"],
+                    "ma_chinh": info.get("ma_chinh", []),
+                    "ma_btp": info.get("ma_btp", []),
+                    "ma_vat_tu": info.get("ma_vat_tu", []),
+                    "ma_lien_quan": info.get("ma_lien_quan", []),
                     "loai_tai_lieu": info["loai_tai_lieu"],
                     "ten_san_pham": info["ten_tai_lieu"],
                     "cong_doan": info["cong_doan"],
@@ -734,7 +776,11 @@ def process_and_ingest_pdf(pdf_path, ten_file, thu_muc, vision_model=None, progr
                 all_chunks = []
                 title_block = (
                     f"Thong tin tai lieu {ten_file}:\n"
-                    f"- Ma doi tuong: {info['ma_doi_tuong']}\n"
+                    f"- Ma chinh: {info.get('ma_chinh', [])}\n"
+                    f"- Ma BTP: {info.get('ma_btp', [])}\n"
+                    f"- Ma vat tu: {info.get('ma_vat_tu', [])}\n"
+                    f"- Ma lien quan: {info.get('ma_lien_quan', [])}\n"
+                    f"- Ma doi tuong tong hop: {info['ma_doi_tuong']}\n"
                     f"- Loai tai lieu: {info['loai_tai_lieu']}\n"
                     f"- Ten tai lieu/san pham: {info['ten_tai_lieu']}\n"
                     f"- Cong doan: {info['cong_doan']}\n"
@@ -934,6 +980,10 @@ def process_and_ingest_file(file_path, ten_file, thu_muc, vision_model=None, pro
             "file_goc": ten_file,
             "phong_ban_quyen": thu_muc,
             "ma_doi_tuong": info["ma_doi_tuong"],
+            "ma_chinh": info.get("ma_chinh", []),
+            "ma_btp": info.get("ma_btp", []),
+            "ma_vat_tu": info.get("ma_vat_tu", []),
+            "ma_lien_quan": info.get("ma_lien_quan", []),
             "loai_tai_lieu": info["loai_tai_lieu"],
             "ten_san_pham": info["ten_tai_lieu"],
             "cong_doan": info["cong_doan"],
@@ -956,7 +1006,11 @@ def process_and_ingest_file(file_path, ten_file, thu_muc, vision_model=None, pro
         all_chunks = []
         title_block = (
             f"Thong tin tai lieu {ten_file}:\n"
-            f"- Ma doi tuong: {info['ma_doi_tuong']}\n"
+            f"- Ma chinh: {info.get('ma_chinh', [])}\n"
+            f"- Ma BTP: {info.get('ma_btp', [])}\n"
+            f"- Ma vat tu: {info.get('ma_vat_tu', [])}\n"
+            f"- Ma lien quan: {info.get('ma_lien_quan', [])}\n"
+            f"- Ma doi tuong tong hop: {info['ma_doi_tuong']}\n"
             f"- Loai tai lieu: {info['loai_tai_lieu']}\n"
             f"- Ten tai lieu/san pham: {info['ten_tai_lieu']}\n"
             f"- Cong doan/thu muc: {info['cong_doan']}\n"

@@ -338,18 +338,33 @@ def save_bom_records(doc_id, trang_so, records):
         logger.error(f"Loi save_bom_records cho doc_id {doc_id}, trang {trang_so}: {e}", exc_info=True)
 
 def search_bom_by_code(ma_hang_list):
-    """Tim kiem bang ke vat tu tren SQL theo ma hang"""
+    """Tim kiem bang ke vat tu tren SQL theo ma hang hoac ma doi tuong (parent assembly)"""
     if not ma_hang_list:
         return []
     _ensure_engine()
     try:
         with engine.connect() as conn:
-            query = text("""
-                SELECT b.MaHang, b.TenVatTu, b.VatLieu, b.SoLuong, b.GhiChu, t.TenFile 
+            # Tao dieu kien OR cho tung ma bang EXISTS de tranh bo sot khi khac trang
+            conditions = []
+            for i in range(len(ma_hang_list)):
+                conditions.append(f"""
+                (
+                    b.MaHang LIKE :m{i} 
+                    OR EXISTS (
+                        SELECT 1 
+                        FROM TaiLieuKyThuat tk 
+                        WHERE tk.DocID = b.DocID 
+                        AND tk.MaDoiTuong LIKE :m{i}
+                    )
+                )
+                """)
+            
+            query = text(f"""
+                SELECT DISTINCT b.MaHang, b.TenVatTu, b.VatLieu, b.SoLuong, b.GhiChu, t.TenFile 
                 FROM BangKeVatTu b
                 JOIN TaiLieu t ON b.DocID = t.DocID
                 WHERE t.TrangThai = 'published' AND (
-                    """ + " OR ".join([f"b.MaHang LIKE :m{i}" for i in range(len(ma_hang_list))]) + """
+                    {" OR ".join(conditions)}
                 )
             """)
             params = {f"m{i}": f"%{m}%" for i, m in enumerate(ma_hang_list)}

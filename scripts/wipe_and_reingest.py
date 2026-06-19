@@ -4,7 +4,7 @@ from sqlalchemy import text
 from qdrant_client import QdrantClient
 from dotenv import load_dotenv
 
-# Load .env de doc QDRANT_URL / QDRANT_PATH giong het rag_logic.py
+# Load .env de doc QDRANT_URL va QDRANT_API_KEY giong het rag_logic.py
 load_dotenv()
 
 # ====================================================
@@ -12,19 +12,28 @@ load_dotenv()
 # ====================================================
 print("1. Dang xoa collection Qdrant 'TaiLieuKyThuat_v2'...")
 temp_client = None
+from qdrant_client.http.exceptions import UnexpectedResponse
+
 try:
     qdrant_url = os.getenv("QDRANT_URL", "")
-    qdrant_path = os.getenv("QDRANT_PATH", "./Mechanical_Qdrant_DB")
-    if qdrant_url:
-        print(f" -> Ket noi Qdrant Server: {qdrant_url}")
-        temp_client = QdrantClient(url=qdrant_url)
-    else:
-        print(f" -> Dung Qdrant Local: {qdrant_path}")
-        temp_client = QdrantClient(path=qdrant_path)
+    qdrant_api_key = os.getenv("QDRANT_API_KEY", "")
+    
+    if not qdrant_url or not qdrant_api_key:
+        raise ValueError("Thieu thiet lap QDRANT_URL hoac QDRANT_API_KEY trong file .env")
+
+    print(f" -> Ket noi Qdrant Cloud: {qdrant_url}")
+    temp_client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
     temp_client.delete_collection(collection_name="TaiLieuKyThuat_v2")
     print(" -> Da xoa Qdrant collection thanh cong.")
+except UnexpectedResponse as e:
+    if e.status_code == 404:
+        print(" -> Qdrant collection chua ton tai, bo qua loi xoa.")
+    else:
+        print(f" -> Loi khi xoa Qdrant: {e}")
+        raise e
 except Exception as e:
-    print(f" -> Khong the xoa Qdrant (co the chua ton tai): {e}")
+    print(f" -> Loi nghiem trong khi xoa Qdrant: {e}")
+    raise e
 finally:
     # Fix: dong client trong finally de giai phong file-lock o che do Qdrant local.
     # Neu khong, lan import rag_logic ngay sau co the bao 'already accessed by another instance'.
@@ -50,6 +59,21 @@ try:
     print(" -> Da don dep SQL Server thanh cong.")
 except Exception as e:
     print(f" -> Loi xoa SQL Server: {e}")
+
+print("2b. Dang xoa file anh cu trong Data_Anh_Da_Tach...")
+import shutil
+base_dir = os.path.dirname(os.path.abspath(__file__))
+anh_dir = os.path.join(base_dir, "Data_Anh_Da_Tach")
+if os.path.exists(anh_dir):
+    try:
+        shutil.rmtree(anh_dir)
+        os.makedirs(anh_dir)
+        print(" -> Da don dep thu muc Data_Anh_Da_Tach thanh cong.")
+    except Exception as e:
+        print(f" -> Loi xoa Data_Anh_Da_Tach: {e}")
+else:
+    os.makedirs(anh_dir)
+    print(" -> Da tao moi thu muc Data_Anh_Da_Tach.")
 
 
 # ====================================================

@@ -1,0 +1,5 @@
+{"id":"L1_001","question":"Dung sai độ dày vật liệu của 9.3.03843 là bao nhiêu?","expected_keywords":["±0.2 mm"],"expected_sources":["9.3.03843"],"should_refuse":false, "level":"L1 Tra Cứu"}
+{"id":"L1_002","question":"Vật liệu chính của 9.3.03844 là gì?","expected_keywords":["Inox","SUS","304"],"expected_sources":["9.3.03844"],"should_refuse":false, "level":"L1 Tra Cứu"}
+{"id":"L2_001","question":"So sánh dung sai của 9.3.03843 và 9.3.03844","expected_keywords":["9.3.03843", "9.3.03844"],"expected_sources":["9.3.03843", "9.3.03844"],"should_refuse":false, "level":"L2 So Sánh"}
+{"id":"L3_001","question":"Chi phí gia công 1 sản phẩm 9.3.03843 là bao nhiêu tiền?","expected_keywords":["tài liệu hiện tại không ghi","không tự ước lượng"],"expected_sources":[],"should_refuse":true, "level":"L3 Cấm Địa Bịa Số Liệu"}
+{"id":"L3_002","question":"Thời gian gia công bản vẽ 9.3.03844 mất bao lâu?","expected_keywords":["tài liệu hiện tại không ghi","không tự ước lượng"],"expected_sources":[],"should_refuse":true, "level":"L3 Cấm Địa Bịa Số Liệu"}

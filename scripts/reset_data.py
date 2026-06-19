@@ -3,6 +3,9 @@ import shutil
 import glob
 from sqlalchemy import text
 import sys
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Thêm đường dẫn gốc để import db_logic
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -54,16 +57,20 @@ def reset_all_data():
     except Exception as e:
         print(f"Lỗi khi xóa SQL Server: {e}")
 
-    # 4. Xóa Qdrant DB
-    qdrant_dir = os.path.join(BASE_DIR, "Mechanical_Qdrant_DB")
-    if os.path.exists(qdrant_dir):
-        try:
-            shutil.rmtree(qdrant_dir)
-            print(f"Đã xóa vector database Qdrant tại {qdrant_dir}")
-        except Exception as e:
-            print(f"KHÔNG THỂ XÓA QDRANT DB (Lý do: {e}).")
-            print("BẠN PHẢI TẮT STREAMLIT (Ctrl+C) TRƯỚC KHI CHẠY SCRIPT NÀY!")
-            return False
+    # 4. Xóa Qdrant DB trên Cloud
+    print("4. Đang xóa collection Qdrant 'TaiLieuKyThuat_v2' trên Cloud...")
+    try:
+        from qdrant_client import QdrantClient
+        qdrant_url = os.getenv("QDRANT_URL", "")
+        qdrant_api_key = os.getenv("QDRANT_API_KEY", "")
+        if qdrant_url and qdrant_api_key:
+            client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
+            client.delete_collection(collection_name="TaiLieuKyThuat_v2")
+            print("Đã xóa Qdrant collection thành công.")
+        else:
+            print("Không tìm thấy QDRANT_URL hoặc QDRANT_API_KEY trong .env.")
+    except Exception as e:
+        print(f"Lỗi khi xóa Qdrant collection: {e}")
 
     print("\nHOÀN TẤT XÓA DỮ LIỆU! Hệ thống đã trống không.")
     return True

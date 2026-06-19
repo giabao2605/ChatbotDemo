@@ -213,15 +213,23 @@ def update_chat_feedback(chat_id, danh_gia):
 # ==========================================
 def _get_or_create_doc(conn, file_name, thu_muc):
     row = conn.execute(
-        text("SELECT DocID FROM TaiLieu WHERE TenFile = :f AND ThuMuc = :t"),
+        text("SELECT DocID, TrangThai FROM TaiLieu WHERE TenFile = :f AND ThuMuc = :t"),
         {"f": file_name, "t": thu_muc},
     ).fetchone()
     if row:
-        return row[0]
+        doc_id, trang_thai = row
+        if trang_thai == 'published':
+            raise ValueError(f"Tài liệu {file_name} đã được published. Không cho phép re-ingest để bảo toàn dữ liệu.")
+        # Neu tai lieu cu duoc ingest lai, set no ve pending_review
+        conn.execute(
+            text("UPDATE TaiLieu SET TrangThai = 'pending_review' WHERE DocID = :d"),
+            {"d": doc_id}
+        )
+        return doc_id
     res = conn.execute(
         text(
-            "INSERT INTO TaiLieu (TenFile, ThuMuc, TrangThaiVector) "
-            "OUTPUT INSERTED.DocID VALUES (:f, :t, 1)"
+            "INSERT INTO TaiLieu (TenFile, ThuMuc, TrangThaiVector, TrangThai) "
+            "OUTPUT INSERTED.DocID VALUES (:f, :t, 1, 'pending_review')"
         ),
         {"f": file_name, "t": thu_muc},
     )
@@ -236,9 +244,12 @@ def reset_document_metadata(file_name, thu_muc):
             doc_id = _get_or_create_doc(conn, file_name, thu_muc)
             if doc_id is not None:
                 conn.execute(text("DELETE FROM TaiLieuKyThuat WHERE DocID = :d"), {"d": doc_id})
+                conn.execute(text("DELETE FROM BangKeVatTu WHERE DocID = :d"), {"d": doc_id})
             return doc_id
     except Exception as e:
         logger.error(f"Loi reset metadata {file_name}: {e}", exc_info=True)
+        if isinstance(e, ValueError) and "published" in str(e):
+            raise e
         return None
  
 def _prepare_metadata_params(info):
@@ -299,3 +310,120 @@ def save_document_metadata(file_name, thu_muc, info):
     """Tuong thich nguoc cho file 1 trang (non-PDF): reset + insert mot lan."""
     doc_id = reset_document_metadata(file_name, thu_muc)
     return save_page_metadata(file_name, thu_muc, info, doc_id=doc_id)
+
+def save_bom_records(doc_id, trang_so, records):
+    """Luu danh sach cac vat tu cua bang ke vao SQL"""
+    if not doc_id or not records:
+        return
+    _ensure_engine()
+    try:
+        with engine.begin() as conn:
+            for rec in records:
+                conn.execute(
+                    text("""
+                        INSERT INTO BangKeVatTu (DocID, TrangSo, MaHang, TenVatTu, VatLieu, SoLuong, GhiChu)
+                        VALUES (:doc_id, :trang_so, :ma_hang, :ten, :vat_lieu, :sl, :ghi_chu)
+                    """),
+                    {
+                        "doc_id": doc_id,
+                        "trang_so": trang_so,
+                        "ma_hang": _sanitize_text(rec.get("ma_hang"), 255),
+                        "ten": _sanitize_text(rec.get("ten_vat_tu"), 500),
+                        "vat_lieu": _sanitize_text(rec.get("vat_lieu"), 255),
+                        "sl": _sanitize_int(rec.get("so_luong"), None),
+                        "ghi_chu": _sanitize_text(rec.get("ghi_chu"), 4000)
+                    }
+                )
+    except Exception as e:
+        logger.error(f"Loi save_bom_records cho doc_id {doc_id}, trang {trang_so}: {e}", exc_info=True)
+
+def search_bom_by_code(ma_hang_list):
+    """Tim kiem bang ke vat tu tren SQL theo ma hang"""
+    if not ma_hang_list:
+        return []
+    _ensure_engine()
+    try:
+        with engine.connect() as conn:
+            query = text("""
+                SELECT b.MaHang, b.TenVatTu, b.VatLieu, b.SoLuong, b.GhiChu, t.TenFile 
+                FROM BangKeVatTu b
+                JOIN TaiLieu t ON b.DocID = t.DocID
+                WHERE t.TrangThai = 'published' AND (
+                    """ + " OR ".join([f"b.MaHang LIKE :m{i}" for i in range(len(ma_hang_list))]) + """
+                )
+            """)
+            params = {f"m{i}": f"%{m}%" for i, m in enumerate(ma_hang_list)}
+            result = conn.execute(query, params).fetchall()
+            return result
+    except Exception as e:
+        logger.error(f"Loi search_bom_by_code: {e}", exc_info=True)
+        return []
+
+# ==========================================
+# BACKGROUND JOBS
+# ==========================================
+def create_ingestion_job(file_name, file_path, thu_muc):
+    _ensure_engine()
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    """
+                    INSERT INTO IngestionJobs (TenFile, FilePath, ThuMuc, Status)
+                    OUTPUT INSERTED.JobID
+                    VALUES (:f, :p, :t, 'pending')
+                    """
+                ),
+                {"f": file_name, "p": file_path, "t": thu_muc}
+            )
+            row = result.fetchone()
+            return row[0] if row else None
+    except Exception as e:
+        logger.error(f"Loi tao IngestionJob: {e}", exc_info=True)
+        return None
+
+def update_ingestion_job(job_id, status, error_message=None):
+    _ensure_engine()
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    UPDATE IngestionJobs
+                    SET Status = :s, ErrorMessage = :e, UpdatedAt = GETDATE()
+                    WHERE JobID = :id
+                    """
+                ),
+                {"s": status, "e": error_message, "id": job_id}
+            )
+    except Exception as e:
+        logger.error(f"Loi cap nhat IngestionJob {job_id}: {e}", exc_info=True)
+
+def get_pending_job():
+    _ensure_engine()
+    try:
+        with engine.connect() as conn:
+            # Dung UPDATE voi OUTPUT cho atomic picking (chong race condition neu co nhieu worker)
+            result = conn.execute(
+                text(
+                    """
+                    WITH CTE AS (
+                        SELECT TOP 1 JobID, Status
+                        FROM IngestionJobs
+                        WHERE Status = 'pending'
+                        ORDER BY CreatedAt ASC
+                    )
+                    UPDATE CTE
+                    SET Status = 'extracting'
+                    OUTPUT inserted.JobID, inserted.TenFile, inserted.FilePath, inserted.ThuMuc;
+                    """
+                )
+            )
+            row = result.fetchone()
+            if row:
+                conn.commit()
+                return {"job_id": row[0], "ten_file": row[1], "file_path": row[2], "thu_muc": row[3]}
+            return None
+    except Exception as e:
+        logger.error(f"Loi lay pending job: {e}", exc_info=True)
+        return None

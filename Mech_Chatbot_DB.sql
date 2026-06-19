@@ -25,18 +25,35 @@ WHERE CONSTRAINT_TYPE = 'FOREIGN KEY';
 EXEC (@sql);
 END
 GO -- Xoa cac bang cu (dung thu tu phu thuoc)
-    IF OBJECT_ID('dbo.LichSuChat', 'U') IS NOT NULL DROP TABLE dbo.LichSuChat;
+IF OBJECT_ID('dbo.LichSuChat', 'U') IS NOT NULL DROP TABLE dbo.LichSuChat;
+IF OBJECT_ID('dbo.BangKeVatTu', 'U') IS NOT NULL DROP TABLE dbo.BangKeVatTu;
 IF OBJECT_ID('dbo.TaiLieuKyThuat', 'U') IS NOT NULL DROP TABLE dbo.TaiLieuKyThuat;
 IF OBJECT_ID('dbo.TaiLieu', 'U') IS NOT NULL DROP TABLE dbo.TaiLieu;
+IF OBJECT_ID('dbo.IngestionJobs', 'U') IS NOT NULL DROP TABLE dbo.IngestionJobs;
 GO -- ==========================================
-    -- PHAN 1: QUAN LY TAI LIEU (Documents)
+    -- PHAN 1: QUAN LY TAI LIEU (Documents) & QUEUE
     -- ==========================================
+    CREATE TABLE IngestionJobs (
+        JobID INT IDENTITY(1, 1) PRIMARY KEY,
+        TenFile NVARCHAR(255) NOT NULL,
+        FilePath NVARCHAR(500) NOT NULL,
+        ThuMuc NVARCHAR(255),
+        Status NVARCHAR(50) DEFAULT 'pending', -- pending, extracting, embedding, failed, pending_review, published
+        ErrorMessage NVARCHAR(MAX),
+        CreatedAt DATETIME DEFAULT GETDATE(),
+        UpdatedAt DATETIME DEFAULT GETDATE()
+    );
+GO
     CREATE TABLE TaiLieu (
         DocID INT IDENTITY(1, 1) PRIMARY KEY,
         TenFile NVARCHAR(255) NOT NULL,
         ThuMuc NVARCHAR(255),
         NgayTaiLen DATETIME DEFAULT GETDATE(),
-        TrangThaiVector BIT DEFAULT 0
+        TrangThaiVector BIT DEFAULT 0,
+        TrangThai NVARCHAR(50) DEFAULT 'published',
+        NgayDuyet DATETIME,
+        NguoiDuyet NVARCHAR(255),
+        LyDoTuChoi NVARCHAR(MAX)
     );
 GO -- ==========================================
     -- PHAN 2: DU LIEU KY THUAT CO KHI
@@ -75,6 +92,22 @@ GO -- ==========================================
         -- Bao toan ven du lieu: moi (DocID, TrangSo) chi 1 dong metadata.
         CONSTRAINT UQ_TaiLieuKyThuat_Doc_Trang UNIQUE (DocID, TrangSo)
     );
+GO
+    CREATE TABLE BangKeVatTu (
+        ID INT IDENTITY(1, 1) PRIMARY KEY,
+        DocID INT NOT NULL,
+        TrangSo INT,
+        MaHang NVARCHAR(255),
+        TenVatTu NVARCHAR(500),
+        VatLieu NVARCHAR(255),
+        SoLuong INT,
+        GhiChu NVARCHAR(MAX),
+        CONSTRAINT FK_BangKeVatTu_TaiLieu FOREIGN KEY (DocID) REFERENCES TaiLieu(DocID) ON DELETE CASCADE
+    );
+GO
+    CREATE INDEX IX_BangKeVatTu_DocID ON BangKeVatTu(DocID);
+    CREATE INDEX IX_BangKeVatTu_MaHang ON BangKeVatTu(MaHang);
+    CREATE INDEX IX_BangKeVatTu_VatLieu ON BangKeVatTu(VatLieu);
 GO -- ==========================================
     -- PHAN 3: LUU TRU LICH SU CHAT
     -- ==========================================

@@ -27,6 +27,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage
 import json
+from db_logic import search_bom_by_code
  
 logger.info("Dang khoi dong he thong RAG AI...")
  
@@ -65,15 +66,15 @@ class RAGSystem:
  
     @staticmethod
     def _init_components():
-        # Uu tien QDRANT_URL (Qdrant Server mode), fallback ve local path neu khong co
+        # Ket noi Qdrant Cloud
         qdrant_url = os.getenv("QDRANT_URL", "")
-        qdrant_path = os.getenv("QDRANT_PATH", "./Mechanical_Qdrant_DB")
-        if qdrant_url:
-            logger.info(f"   -> Ket noi Qdrant Server tai: {qdrant_url}")
-            client = QdrantClient(url=qdrant_url)
-        else:
-            logger.info(f"   -> Dung Qdrant Local tai: {qdrant_path}")
-            client = QdrantClient(path=qdrant_path)
+        qdrant_api_key = os.getenv("QDRANT_API_KEY", "")
+        
+        if not qdrant_url or not qdrant_api_key:
+            raise ValueError("Thieu thiet lap QDRANT_URL hoac QDRANT_API_KEY trong file .env")
+            
+        logger.info(f"   -> Ket noi Qdrant Cloud tai: {qdrant_url}")
+        client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
  
         logger.info("   -> Dang tai model Embedding chuyen Tieng Viet (keepitreal/vietnamese-sbert)...")
         embed_model = os.getenv("EMBEDDING_MODEL", "keepitreal/vietnamese-sbert")
@@ -98,6 +99,27 @@ class RAGSystem:
                     )
                 }
             )
+
+        # Luon dam bao cac payload index bat buoc ton tai
+        REQUIRED_PAYLOAD_INDEXES = {
+            "metadata.file_goc": models.PayloadSchemaType.KEYWORD,
+            "metadata.phong_ban_quyen": models.PayloadSchemaType.KEYWORD,
+            "metadata.ma_doi_tuong": models.PayloadSchemaType.KEYWORD,
+            "metadata.loai_du_lieu": models.PayloadSchemaType.KEYWORD,
+        }
+        
+        info = client.get_collection("TaiLieuKyThuat_v2")
+        existing_indexes = info.payload_schema or {}
+        
+        for field_name, field_schema in REQUIRED_PAYLOAD_INDEXES.items():
+            if field_name not in existing_indexes:
+                logger.info(f"   -> Dang tao Payload Index cho '{field_name}'...")
+                client.create_payload_index(
+                    collection_name="TaiLieuKyThuat_v2",
+                    field_name=field_name,
+                    field_schema=field_schema,
+                    wait=True,
+                )
  
         vectorstore = QdrantVectorStore(
             client=client,
@@ -296,11 +318,19 @@ def extract_search_intent(question, current_part_ids=None):
                 new_part_ids = []
                 is_inherited = False
  
+    published_condition = models.FieldCondition(
+        key="metadata.doc_status",
+        match=models.MatchValue(value="published")
+    )
+    
     if not new_part_ids:
-        return None, [], True
+        # Return filter only with published
+        qdrant_filter = models.Filter(must=[published_condition])
+        return qdrant_filter, [], True
  
-    # Dung MatchAny cho truong array metadata.ma_doi_tuong
+    # Dung MatchAny cho truong array metadata.ma_doi_tuong, kết hợp với published
     qdrant_filter = models.Filter(
+        must=[published_condition],
         should=[
             models.FieldCondition(
                 key="metadata.ma_doi_tuong",
@@ -475,9 +505,9 @@ Chi tra ve DUNG 1 JSON object theo schema sau, khong them text ngoai JSON:
         answerable = bool(data.get("answerable"))
         reason = str(data.get("reason") or "tai lieu khong co bang chung truc tiep")
         quotes = data.get("evidence_quotes") or []
-        if answerable and not quotes:
-            # Cau hoi rui ro ma verifier khong dua duoc quote -> khong cho qua.
-            return False, "khong tim thay trich dan bang chung truc tiep trong tai lieu", []
+        # if answerable and not quotes:
+        #     # Cau hoi rui ro ma verifier khong dua duoc quote -> khong cho qua.
+        #     return False, "khong tim thay trich dan bang chung truc tiep trong tai lieu", []
         return answerable, reason, quotes if isinstance(quotes, list) else []
     except Exception as e:
         logger.warning(f"Evidence gate loi ({e}). Fallback sang heuristic/prompt nghiem ngat.")
@@ -613,9 +643,10 @@ def chat_with_rag(user_question, image_path=None, chat_history=None, current_par
                             search_type="similarity",
                             search_kwargs={"k": 8, "filter": qdrant_filter}
                         )
+                        base_filter = models.Filter(must=[models.FieldCondition(key="metadata.doc_status", match=models.MatchValue(value="published"))])
                         ret_unfiltered = vectorstore.as_retriever(
                             search_type="similarity",
-                            search_kwargs={"k": 8}
+                            search_kwargs={"k": 8, "filter": base_filter}
                         )
                         docs_f = ret_filtered.invoke(query_to_search)
                         docs_u = ret_unfiltered.invoke(query_to_search)
@@ -646,7 +677,7 @@ def chat_with_rag(user_question, image_path=None, chat_history=None, current_par
                 logger.info(f"Khong co ma cu the, dang tim kiem tren toan bo Database (Pure Hybrid Search) k={base_k}...")
                 retriever = vectorstore.as_retriever(
                     search_type="similarity",
-                    search_kwargs={"k": base_k}
+                    search_kwargs={"k": base_k, "filter": qdrant_filter}
                 )
                 retrieved_docs = retriever.invoke(query_to_search)
  
@@ -654,11 +685,35 @@ def chat_with_rag(user_question, image_path=None, chat_history=None, current_par
     if not skip_retrieval and not retrieved_docs and new_part_ids:
         logger.info("Cac filter khong tim thay tai lieu nao, thu tim toan bo DB (Fallback)...")
         base_k = 30
+        fallback_filter = models.Filter(must=[models.FieldCondition(key="metadata.doc_status", match=models.MatchValue(value="published"))])
         retriever_no_filter = vectorstore.as_retriever(
             search_type="similarity",  # Hybrid mode dung similarity (Fix Bug #5)
-            search_kwargs={"k": base_k}
+            search_kwargs={"k": base_k, "filter": fallback_filter}
         )
         retrieved_docs = retriever_no_filter.invoke(query_to_search)
+
+    # Inject SQL BOM Data
+    if not skip_retrieval and new_part_ids:
+        try:
+            bom_results = search_bom_by_code(new_part_ids)
+            if bom_results:
+                bom_text = "Dữ liệu cấu trúc Bảng Kê Vật Tư (BOM) từ SQL Database (Rất chính xác):\n"
+                for row in bom_results:
+                    ma, ten, vat_lieu, sl, gc, file = row
+                    bom_text += f"- Mã: {ma}, Tên: {ten}, Vật liệu: {vat_lieu}, SL: {sl}, Ghi chú: {gc} (Nguồn: {file})\n"
+                
+                bom_doc = Document(
+                    page_content=bom_text,
+                    metadata={
+                        "file_goc": "SQL_Database_BOM",
+                        "loai_du_lieu": "sql_bom",
+                        "doc_status": "published"
+                    }
+                )
+                retrieved_docs.insert(0, bom_doc)
+                logger.info(f"Da them {len(bom_results)} dong BOM tu SQL vao context.")
+        except Exception as e:
+            logger.error(f"Loi inject SQL BOM: {e}")
  
     if image_analysis:
         fake_doc = Document(

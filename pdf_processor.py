@@ -15,11 +15,23 @@ import underthesea
 from qdrant_client import models
 from logger_config import logger
 # FIX #1: dung 2 ham moi (reset 1 lan + insert tung trang). Giu save_document_metadata cho file 1 trang.
-from db_logic import reset_document_metadata, save_page_metadata, save_document_metadata
+from db_logic import reset_document_metadata, save_page_metadata, save_document_metadata, save_bom_records
 from rag_logic import vectorstore, client
 # FIX Bug #4: predicate retry dung chung cho Gemini (google-genai)
-from gemini_client import is_retryable_error
+from gemini_client import describe_gemini_error, is_retryable_error
 from functools import lru_cache
+
+def _env_bool(name, default=False):
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+EMBEDDING_CHUNK_SIZE = int(os.getenv("EMBEDDING_CHUNK_SIZE", "220"))
+EMBEDDING_CHUNK_OVERLAP = int(os.getenv("EMBEDDING_CHUNK_OVERLAP", "40"))
+STRICT_INGEST_REQUIRE_VISION = _env_bool("STRICT_INGEST_REQUIRE_VISION", True)
+ROLLBACK_ON_INGEST_ERROR = _env_bool("ROLLBACK_ON_INGEST_ERROR", True)
+GEMINI_METADATA_MODE = os.getenv("GEMINI_METADATA_MODE", "missing_only").strip().lower()
 
 def remove_accents(text: str) -> str:
     if text is None:
@@ -52,8 +64,8 @@ def tokenizer_length(text):
  
 # Token-based Text Splitter dung chung cho toan bo module
 token_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=480,
-    chunk_overlap=80,
+    chunk_size=EMBEDDING_CHUNK_SIZE,
+    chunk_overlap=EMBEDDING_CHUNK_OVERLAP,
     length_function=tokenizer_length
 )
  
@@ -105,7 +117,17 @@ SUPPORTED_LEARNING_EXTENSIONS = (
 )
  
 # 1. Ham trich xuat thong minh (Di chuyen tu file cu sang)
-def extract_metadata_smart(text, ten_file, thu_muc, vision_model=None):
+def _metadata_needs_llm(result):
+    if GEMINI_METADATA_MODE in {"off", "false", "0", "none"}:
+        return False
+    if GEMINI_METADATA_MODE == "always":
+        return True
+    if not result.get("ma_doi_tuong"):
+        return True
+    critical_fields = ("ten_tai_lieu", "loai_tai_lieu", "vat_lieu")
+    return any(str(result.get(field) or "").strip() in {"", "Khong ro"} for field in critical_fields)
+
+def extract_metadata_smart(text, ten_file, thu_muc, vision_model=None, quality_warnings=None):
     """
     Chien luoc: Regex-first -> Gemini-fallback.
     Luu y: LLM chi duoc goi khi Regex tra ve "Khong ro".
@@ -236,9 +258,9 @@ def extract_metadata_smart(text, ten_file, thu_muc, vision_model=None):
         "yckt": yckt_text.strip(), "hdcv": hdcv_val
     }
  
-    # HYBRID APPROACH: LLM Extraction de doc moi ma (V2)
-    # KHONG BO QUA GOI GEMINI: Cho phep Gemini bo sung hoac sua ma tu Regex
-    if vision_model:
+    # HYBRID APPROACH: LLM Extraction de doc moi ma (V2).
+    # Mac dinh chi goi Gemini khi metadata quan trong con thieu de giam rate limit.
+    if vision_model and _metadata_needs_llm(result):
         prompt = f"""
         Ban la chuyen gia doc tai lieu co khi. Hay trich xuat cac thong tin sau tu doan text, tra ve dung dinh dang JSON:
             "ma_doi_tuong": ["ma 1", "ma 2"],
@@ -269,7 +291,11 @@ def extract_metadata_smart(text, ten_file, thu_muc, vision_model=None):
             if "vat_lieu" in llm_result and llm_result["vat_lieu"] and llm_result["vat_lieu"] != "Khong ro":
                 result["vat_lieu"] = str(llm_result["vat_lieu"]).strip()
         except Exception as e:
-            logger.error(f"Loi LLM Fallback boc tach metadata cho {ten_file}: {e}")
+            detail = describe_gemini_error(e)
+            msg = f"Loi LLM Fallback boc tach metadata cho {ten_file}: {detail}"
+            logger.error(msg)
+            if quality_warnings is not None:
+                quality_warnings.append(msg)
  
     return result
  
@@ -284,6 +310,23 @@ def call_gemini_vision(vision_model, prompt, image=None):
         return vision_model.generate_content([prompt, image])
     else:
         return vision_model.generate_content(prompt)
+
+@retry(
+    wait=wait_exponential(multiplier=2, min=2, max=30),
+    stop=stop_after_attempt(4),
+    reraise=True
+)
+def _add_docs_with_retry(chunks):
+    vectorstore.add_documents(chunks)
+
+def _delete_vectors_for_file(ten_file, thu_muc):
+    client.delete(
+        collection_name="TaiLieuKyThuat_v2",
+        points_selector=models.Filter(must=[
+            models.FieldCondition(key="metadata.file_goc", match=models.MatchValue(value=ten_file)),
+            models.FieldCondition(key="metadata.phong_ban_quyen", match=models.MatchValue(value=thu_muc)),
+        ])
+    )
  
 def _require_package(package, feature_name):
     if package is None:
@@ -392,18 +435,71 @@ def _read_presentation_file(file_path):
             slides.append(f"Slide {slide_index}:\n" + "\n\n".join(parts))
     return "\n\n---\n\n".join(slides)
  
+def parse_vision_json(raw_text):
+    """Parse JSON tu Gemini tra ve, ho tro fallback regex"""
+    try:
+        json_str = raw_text
+        if "```json" in json_str:
+            json_str = json_str.split("```json")[1].split("```")[0].strip()
+        elif "```" in json_str:
+            json_str = json_str.split("```")[1].split("```")[0].strip()
+        else:
+            match = re.search(r'\{.*\}', json_str, re.DOTALL)
+            if match:
+                json_str = match.group(0)
+                
+        data = json.loads(json_str)
+        return data
+    except Exception as e:
+        logger.warning(f"Khong the parse JSON tu vision: {e}")
+        return None
+
+def format_vision_data(data):
+    """Format dictionary thanh text de dua vao Qdrant"""
+    if not data:
+        return ""
+    
+    parts = []
+    if data.get("document_codes"):
+        parts.append(f"- Mã bản vẽ/tài liệu: {', '.join([str(x) for x in data['document_codes']])}")
+    if data.get("part_names"):
+        parts.append(f"- Tên chi tiết/vật tư: {', '.join([str(x) for x in data['part_names']])}")
+    if data.get("materials"):
+        parts.append(f"- Vật liệu: {', '.join([str(x) for x in data['materials']])}")
+    if data.get("dimensions"):
+        parts.append(f"- Kích thước nổi bật: {', '.join([str(x) for x in data['dimensions']])}")
+    if data.get("tolerances"):
+        parts.append(f"- Dung sai: {', '.join([str(x) for x in data['tolerances']])}")
+    if data.get("technical_notes"):
+        parts.append("- Ghi chú kỹ thuật:\n  " + "\n  ".join([str(x) for x in data["technical_notes"]]))
+    if data.get("bom_rows"):
+        parts.append("- Các hàng vật tư (BOM) nhận diện được:\n  " + "\n  ".join([str(row) for row in data["bom_rows"]]))
+    if data.get("uncertain_fields"):
+        parts.append(f"- Các phần mờ/không chắc chắn: {', '.join([str(x) for x in data['uncertain_fields']])}")
+        
+    return "Kết quả phân tích ảnh (Cấu trúc JSON):\n" + "\n".join(parts) if parts else ""
 def _read_image_file(file_path, ten_file, vision_model):
     if not vision_model:
         raise ValueError("File anh can GOOGLE_API_KEY hop le de Gemini Vision doc noi dung/OCR.")
     image = Image.open(file_path)
     prompt = (
         f"Day la file anh '{ten_file}' duoc nap lam du lieu cho chatbot ky thuat. "
-        "Hay OCR va mo ta day du moi chu, bang, ma so, kich thuoc, thong so, ghi chu ky thuat, "
-        "vat lieu, quy trinh hoac chi tiet co khi nhin thay trong anh. "
-        "Tra loi bang tieng Viet, trinh bay co cau truc de dung lam du lieu RAG."
+        "Hay OCR va tra ve ket qua DUOI DANG JSON voi schema sau:\n"
+        "{\n"
+        '  "document_codes": [],\n'
+        '  "part_names": [],\n'
+        '  "materials": [],\n'
+        '  "dimensions": [],\n'
+        '  "tolerances": [],\n'
+        '  "technical_notes": [],\n'
+        '  "bom_rows": [],\n'
+        '  "uncertain_fields": []\n'
+        "}\n"
+        "Luon tra ve dung dinh dang JSON (khong kem text mo dau/ket thuc ngoai block ```json). "
+        "Dien vao cac mang cac thong tin ky thuat tuong ung ban nhin thay trong anh."
     )
     response = call_gemini_vision(vision_model, prompt, image)
-    return response.text
+    return format_vision_json(response.text)
  
 def extract_text_from_supported_file(file_path, ten_file, vision_model=None):
     ext = os.path.splitext(file_path)[1].lower()
@@ -426,6 +522,51 @@ def extract_text_from_supported_file(file_path, ten_file, vision_model=None):
     supported = ", ".join(sorted(SUPPORTED_LEARNING_EXTENSIONS))
     raise ValueError(f"Dinh dang {ext or '(khong co duoi file)'} chua duoc ho tro. Cac dinh dang dang ho tro: {supported}")
  
+def extract_bom_records(table):
+    records = []
+    if not table or len(table) < 2: return records
+    
+    cleaned_table = []
+    for row in table:
+        cleaned_row = [str(cell).replace("\n", " ").strip() if cell else "" for cell in row]
+        cleaned_table.append(cleaned_row)
+        
+    header_idx = -1
+    col_map = {'ma': -1, 'ten': -1, 'vat_lieu': -1, 'sl': -1, 'ghi_chu': -1}
+    
+    for row_idx in range(min(5, len(cleaned_table))):
+        row_norm = [remove_accents(h.lower()) for h in cleaned_table[row_idx]]
+        
+        has_ma_or_ten = any(kw in h for h in row_norm for kw in ['ma hang', 'ma vat tu', 'ma chi tiet', 'ma btp', 'ma tp', 'ky hieu', 'ten vat tu', 'vat tu', 'mo ta', 'ten hang', 'chi tiet', 'ten goi'])
+        has_sl_or_vatlieu = any(kw in h for h in row_norm for kw in ['so luong', 'sl', 'vat lieu'])
+        
+        if has_ma_or_ten and has_sl_or_vatlieu:
+            header_idx = row_idx
+            for i, h in enumerate(row_norm):
+                if any(kw in h for kw in ['ma hang', 'ma vat tu', 'ma chi tiet', 'ma btp', 'ma tp', 'ky hieu']) and col_map['ma'] == -1: col_map['ma'] = i
+                elif any(kw in h for kw in ['ten vat tu', 'vat tu', 'mo ta', 'ten hang', 'chi tiet', 'ten goi']) and col_map['ten'] == -1: col_map['ten'] = i
+                elif 'vat lieu' in h and col_map['vat_lieu'] == -1: col_map['vat_lieu'] = i
+                elif ('so luong' in h or h == 'sl') and col_map['sl'] == -1: col_map['sl'] = i
+                elif 'ghi chu' in h and col_map['ghi_chu'] == -1: col_map['ghi_chu'] = i
+            break
+            
+    if header_idx != -1:
+        for row in cleaned_table[header_idx + 1:]:
+            rec = {}
+            if col_map['ma'] != -1 and col_map['ma'] < len(row): rec['ma_hang'] = row[col_map['ma']]
+            if col_map['ten'] != -1 and col_map['ten'] < len(row): rec['ten_vat_tu'] = row[col_map['ten']]
+            if col_map['vat_lieu'] != -1 and col_map['vat_lieu'] < len(row): rec['vat_lieu'] = row[col_map['vat_lieu']]
+            if col_map['sl'] != -1 and col_map['sl'] < len(row): 
+                try: 
+                    num_str = re.sub(r'\D', '', row[col_map['sl']])
+                    rec['so_luong'] = int(num_str) if num_str else None
+                except: rec['so_luong'] = None
+            if col_map['ghi_chu'] != -1 and col_map['ghi_chu'] < len(row): rec['ghi_chu'] = row[col_map['ghi_chu']]
+            
+            if rec.get('ten_vat_tu') or rec.get('ma_hang'):
+                records.append(rec)
+    return records
+
 # 3. Ham xu ly PDF trung tam
 def process_and_ingest_pdf(pdf_path, ten_file, thu_muc, vision_model=None, progress_callback=None):
     start_time = time.time()
@@ -435,6 +576,9 @@ def process_and_ingest_pdf(pdf_path, ten_file, thu_muc, vision_model=None, progr
         "total_pages": 0,
         "total_chunks": 0,
         "failed_pages": [],
+        "vision_failed_pages": [],
+        "metadata_llm_failed_pages": [],
+        "warnings": [],
         "time_taken": 0,
         "message": ""
     }
@@ -474,32 +618,96 @@ def process_and_ingest_pdf(pdf_path, ten_file, thu_muc, vision_model=None, progr
                 pix.save(img_path)
 
                 image_summary = ""
-                is_pure_drawing = len(text.strip()) < 200  # Tang nguong tu 50 len 200 (Fix Bug #10)
+                vision_metadata = {}
+                is_text_heavy = len(text.strip()) > 1500  # Chi bo qua trang van ban thuan
                 
-                # So bo lay ID bang regex tu text goc de xem co ma khong (tiet kiem API)
-                temp_info = extract_metadata_smart(text, ten_file, thu_muc, None)
-                has_valid_id = len(temp_info.get("ma_doi_tuong", [])) > 0
-
-                # CHI GOI GEMINI VISION KHI: Trang khong co ma HOAC la ban ve thuan (it text)
-                if vision_model and os.path.exists(img_path) and (not has_valid_id or is_pure_drawing):
+                # Luon goi Gemini cho PDF ky thuat, tru trang toan text
+                vision_required = os.path.exists(img_path) and not is_text_heavy
+                vision_failed = False
+                if vision_model and vision_required:
                     if progress_callback:
                         progress_callback(f"Dang dung AI (Gemini) phan tich anh trang {page_num+1}...")
                     try:
                         img_to_analyze = Image.open(img_path)
                         prompt = (
                             f"Day la trang so {page_num+1} cua file {ten_file}. "
-                            f"Hay mo ta chi tiet nhung gi ban thay trong hinh anh nay: "
-                            f"hinh dang linh kien, cac goc nhin mat cat, ghi chu ky thuat, cac thong so/kich thuoc quan trong, "
-                            f"hoac so do huong dan cong viec neu co. "
-                            f"Mo ta cua ban se duoc dung de tra cuu RAG, vi vay hay trich xuat bat ky thong tin nao huu ich. Tra loi bang tieng Viet."
+                            "Hay OCR va tra ve ket qua DUOI DANG JSON voi schema sau:\n"
+                            "{\n"
+                            '  "document_codes": [],\n'
+                            '  "part_names": [],\n'
+                            '  "materials": [],\n'
+                            '  "dimensions": [],\n'
+                            '  "tolerances": [],\n'
+                            '  "technical_notes": [],\n'
+                            '  "bom_rows": [],\n'
+                            '  "uncertain_fields": []\n'
+                            "}\n"
+                            "Luon tra ve dung dinh dang JSON (khong kem text mo dau/ket thuc ngoai block ```json). "
+                            "Dien vao cac mang cac thong tin ky thuat tuong ung ban nhin thay trong hinh."
                         )
                         response = call_gemini_vision(vision_model, prompt, img_to_analyze)
-                        image_summary = response.text
+                        vision_data = parse_vision_json(response.text)
+                        
+                        if vision_data:
+                            image_summary = format_vision_data(vision_data)
+                            
+                            # Add to vision_metadata
+                            if vision_data.get("document_codes"): vision_metadata["vision_document_codes"] = ", ".join([str(x) for x in vision_data["document_codes"]])
+                            if vision_data.get("part_names"): vision_metadata["vision_part_names"] = ", ".join([str(x) for x in vision_data["part_names"]])
+                            if vision_data.get("materials"): vision_metadata["vision_materials"] = ", ".join([str(x) for x in vision_data["materials"]])
+                            if vision_data.get("dimensions"): vision_metadata["vision_dimensions"] = ", ".join([str(x) for x in vision_data["dimensions"]])
+                            if vision_data.get("tolerances"): vision_metadata["vision_tolerances"] = ", ".join([str(x) for x in vision_data["tolerances"]])
+                            if vision_data.get("technical_notes"): vision_metadata["vision_technical_notes"] = ", ".join([str(x) for x in vision_data["technical_notes"]])
+                            if vision_data.get("uncertain_fields"): vision_metadata["vision_uncertain_fields"] = ", ".join([str(x) for x in vision_data["uncertain_fields"]])
+                            
+                            # Convert BOM rows if present
+                            if vision_data.get("bom_rows"):
+                                structured_bom = []
+                                for row in vision_data["bom_rows"]:
+                                    if isinstance(row, dict):
+                                        structured_bom.append({
+                                            "ma_hang": str(row.get("ma", row.get("code", row.get("ma_hang", "")))),
+                                            "ten_vat_tu": str(row.get("ten", row.get("name", row.get("ten_vat_tu", "")))),
+                                            "vat_lieu": str(row.get("vat_lieu", row.get("material", ""))),
+                                            "so_luong": row.get("sl", row.get("qty", row.get("so_luong", None))),
+                                            "ghi_chu": str(row.get("ghi_chu", row.get("note", "")))
+                                        })
+                                if structured_bom:
+                                    save_bom_records(doc_id, page_num + 1, structured_bom)
+                        else:
+                            image_summary = response.text
                     except Exception as e:
-                        logger.error(f"Loi khi dung Gemini phan tich {img_name}: {e}")
+                        vision_failed = True
+                        detail = describe_gemini_error(e)
+                        warn = f"Trang {page_num+1}: Gemini Vision/OCR loi cho {img_name}: {detail}"
+                        report["vision_failed_pages"].append(page_num+1)
+                        report["warnings"].append(warn)
+                        logger.error(warn)
+                elif vision_required and not vision_model:
+                    vision_failed = True
+                    warn = f"Trang {page_num+1}: can Gemini Vision/OCR nhung chua cau hinh GOOGLE_API_KEY hop le."
+                    report["vision_failed_pages"].append(page_num+1)
+                    report["warnings"].append(warn)
+                    logger.error(warn)
+
+                if vision_failed and STRICT_INGEST_REQUIRE_VISION:
+                    report["failed_pages"].append(page_num+1)
+                    logger.error(
+                        f"Bo qua nap trang {page_num+1} cua {ten_file} de tranh nap thieu du lieu hinh anh/OCR."
+                    )
+                    continue
 
                 combined_text_for_metadata = text + "\n\n" + image_summary
-                info = extract_metadata_smart(combined_text_for_metadata, ten_file, thu_muc, vision_model)
+                warning_count_before_metadata = len(report["warnings"])
+                info = extract_metadata_smart(
+                    combined_text_for_metadata,
+                    ten_file,
+                    thu_muc,
+                    vision_model,
+                    quality_warnings=report["warnings"],
+                )
+                if len(report["warnings"]) > warning_count_before_metadata:
+                    report["metadata_llm_failed_pages"].append(page_num+1)
 
                 metadata = {
                     "file_goc": ten_file,
@@ -516,6 +724,7 @@ def process_and_ingest_pdf(pdf_path, ten_file, thu_muc, vision_model=None, progr
                     "dung_sai_kich_thuoc": info["dung_sai_khac"],
                     "kich_thuoc_tong_the": info["kich_thuoc"],
                     "trang_so": page_num + 1,
+                    "doc_status": "pending_review",
                 }
                 info['trang_so'] = page_num + 1
  
@@ -547,6 +756,11 @@ def process_and_ingest_pdf(pdf_path, ten_file, thu_muc, vision_model=None, progr
                         page_plumber = pdf_table_reader.pages[page_num]
                         tables = page_plumber.extract_tables()
                         for table in tables:
+                            # Parse BOM records and save to SQL
+                            bom_records = extract_bom_records(table)
+                            if bom_records:
+                                save_bom_records(doc_id, page_num + 1, bom_records)
+                                
                             for row in table:
                                 cleaned_row = [str(cell).replace("\n", " ").strip() if cell else "" for cell in row]
                                 markdown_tables += "| " + " | ".join(cleaned_row) + " |\n"
@@ -582,7 +796,7 @@ def process_and_ingest_pdf(pdf_path, ten_file, thu_muc, vision_model=None, progr
  
                 if image_summary.strip():
                     img_summary_content = f"Phan tich hinh anh tai lieu {ten_file} (Ma: {info['ma_doi_tuong']}):\n{image_summary}"
-                    all_chunks.append(Document(page_content=img_summary_content, metadata={**metadata, "loai_du_lieu": "image_summary"}))
+                    all_chunks.append(Document(page_content=img_summary_content, metadata={**metadata, "loai_du_lieu": "image_summary", **vision_metadata}))
  
                 # FIX #3: GIU text goc cho LLM (noi_dung_goc) TRUOC khi tokenize ban dung cho BM25
                 for chunk in all_chunks:
@@ -592,18 +806,11 @@ def process_and_ingest_pdf(pdf_path, ten_file, thu_muc, vision_model=None, progr
                 # Document Versioning: Xoa vector cu cua file nay truoc khi add (chi xoa 1 lan o trang 1)
                 if page_num == 0:
                     try:
-                        client.delete(
-                            collection_name="TaiLieuKyThuat_v2",
-                            points_selector=models.Filter(must=[
-                                models.FieldCondition(key="metadata.file_goc", match=models.MatchValue(value=ten_file)),
-                                models.FieldCondition(key="metadata.phong_ban_quyen", match=models.MatchValue(value=thu_muc))
-                            ])
-                        )
+                        _delete_vectors_for_file(ten_file, thu_muc)
                     except Exception as e:
-                        logger.error(f"Khong xoa duoc vector cu cua {ten_file}: {e}", exc_info=True)
-                        raise
+                        logger.warning(f"Khong xoa duoc vector cu (bo qua, tiep tuc): {ten_file}: {e}")
  
-                vectorstore.add_documents(all_chunks)
+                _add_docs_with_retry(all_chunks)
                 report["total_chunks"] += len(all_chunks)
  
             except Exception as e:
@@ -627,12 +834,34 @@ def process_and_ingest_pdf(pdf_path, ten_file, thu_muc, vision_model=None, progr
         if doc is not None:
             doc.close()
  
+    if report["status"] == "success" and (report["failed_pages"] or report["total_chunks"] == 0):
+        report["status"] = "error"
+
+    if report["status"] == "error" and ROLLBACK_ON_INGEST_ERROR:
+        try:
+            _delete_vectors_for_file(ten_file, thu_muc)
+            reset_document_metadata(ten_file, thu_muc)
+            report["total_chunks"] = 0
+            report["warnings"].append("Da rollback vector/metadata cua file nay vi ingest khong dat quality gate.")
+        except Exception as e:
+            report["warnings"].append(f"Rollback vector/metadata that bai: {e}")
+            logger.warning(f"Rollback vector/metadata that bai cho {ten_file}: {e}")
+
     report["time_taken"] = round(time.time() - start_time, 2)
+    message_parts = []
+    if report["message"]:
+        message_parts.append(report["message"])
     if report["failed_pages"]:
-        prefix = (report["message"] + " ") if report["message"] else ""
-        report["message"] = prefix + f"(Cac trang loi: {report['failed_pages']})"
-    if not report["message"]:
-        report["message"] = f"Da nap {report['total_chunks']} chunks tu {report['total_pages']} trang."
+        message_parts.append(f"Cac trang loi/bo qua: {report['failed_pages']}")
+    if report["vision_failed_pages"]:
+        message_parts.append(f"Trang loi Gemini Vision/OCR: {report['vision_failed_pages']}")
+    if report["metadata_llm_failed_pages"]:
+        message_parts.append(f"Trang loi Gemini metadata fallback: {report['metadata_llm_failed_pages']}")
+    if report["warnings"]:
+        message_parts.append("Canh bao chat luong: " + " | ".join(report["warnings"][:5]))
+    if not message_parts:
+        message_parts.append(f"Da nap {report['total_chunks']} chunks tu {report['total_pages']} trang.")
+    report["message"] = " ".join(message_parts)
     return report
  
 def process_and_ingest_file(file_path, ten_file, thu_muc, vision_model=None, progress_callback=None):
@@ -644,6 +873,9 @@ def process_and_ingest_file(file_path, ten_file, thu_muc, vision_model=None, pro
         "total_pages": 1,
         "total_chunks": 0,
         "failed_pages": [],
+        "vision_failed_pages": [],
+        "metadata_llm_failed_pages": [],
+        "warnings": [],
         "time_taken": 0,
         "message": ""
     }
@@ -655,7 +887,16 @@ def process_and_ingest_file(file_path, ten_file, thu_muc, vision_model=None, pro
         if not text_content:
             raise ValueError("Khong trich xuat duoc noi dung co the tim kiem tu file nay.")
  
-        info = extract_metadata_smart(text_content[:5000], ten_file, thu_muc, vision_model)
+        warning_count_before_metadata = len(report["warnings"])
+        info = extract_metadata_smart(
+            text_content[:5000],
+            ten_file,
+            thu_muc,
+            vision_model,
+            quality_warnings=report["warnings"],
+        )
+        if len(report["warnings"]) > warning_count_before_metadata:
+            report["metadata_llm_failed_pages"].append(1)
         if info.get("ten_tai_lieu") == "Khong ro":
             info["ten_tai_lieu"] = os.path.splitext(ten_file)[0]
  
@@ -705,6 +946,7 @@ def process_and_ingest_file(file_path, ten_file, thu_muc, vision_model=None, pro
             "kich_thuoc_tong_the": info["kich_thuoc"],
             "trang_so": 1,
             "dinh_dang_file": ext,
+            "doc_status": "pending_review",
         }
         info["trang_so"] = 1
  
@@ -723,7 +965,7 @@ def process_and_ingest_file(file_path, ten_file, thu_muc, vision_model=None, pro
         )
         all_chunks.append(Document(page_content=title_block, metadata={**metadata, "loai_du_lieu": "title_block"}))
  
-        # Dung chung token_splitter da dinh nghia (480 tokens, 80 overlap)
+        # Dung chung token_splitter da dinh nghia theo gioi han embedding.
         chunks = token_splitter.split_text(text_content)
         for i, chunk in enumerate(chunks):
             if chunk.strip():
@@ -740,18 +982,11 @@ def process_and_ingest_file(file_path, ten_file, thu_muc, vision_model=None, pro
         if all_chunks:
             # Document Versioning: Xoa vector cu
             try:
-                client.delete(
-                    collection_name="TaiLieuKyThuat_v2",
-                    points_selector=models.Filter(must=[
-                        models.FieldCondition(key="metadata.file_goc", match=models.MatchValue(value=ten_file)),
-                        models.FieldCondition(key="metadata.phong_ban_quyen", match=models.MatchValue(value=thu_muc))
-                    ])
-                )
+                _delete_vectors_for_file(ten_file, thu_muc)
             except Exception as e:
-                logger.error(f"Khong xoa duoc vector cu cua {ten_file}: {e}", exc_info=True)
-                raise
+                logger.warning(f"Khong xoa duoc vector cu (bo qua, tiep tuc): {ten_file}: {e}")
  
-            vectorstore.add_documents(all_chunks)
+            _add_docs_with_retry(all_chunks)
             report["total_chunks"] += len(all_chunks)
  
     except Exception as e:
@@ -759,7 +994,28 @@ def process_and_ingest_file(file_path, ten_file, thu_muc, vision_model=None, pro
         report["status"] = "error"
         report["message"] = str(e)
  
+    if report["status"] == "success" and report["total_chunks"] == 0:
+        report["status"] = "error"
+
+    if report["status"] == "error" and ROLLBACK_ON_INGEST_ERROR:
+        try:
+            _delete_vectors_for_file(ten_file, thu_muc)
+            reset_document_metadata(ten_file, thu_muc)
+            report["total_chunks"] = 0
+            report["warnings"].append("Da rollback vector/metadata cua file nay vi ingest khong dat quality gate.")
+        except Exception as e:
+            report["warnings"].append(f"Rollback vector/metadata that bai: {e}")
+            logger.warning(f"Rollback vector/metadata that bai cho {ten_file}: {e}")
+
     report["time_taken"] = round(time.time() - start_time, 2)
-    if not report["message"]:
-        report["message"] = f"Da nap {report['total_chunks']} chunks tu file {ext}."
+    message_parts = []
+    if report["message"]:
+        message_parts.append(report["message"])
+    if report["metadata_llm_failed_pages"]:
+        message_parts.append(f"Trang loi Gemini metadata fallback: {report['metadata_llm_failed_pages']}")
+    if report["warnings"]:
+        message_parts.append("Canh bao chat luong: " + " | ".join(report["warnings"][:5]))
+    if not message_parts:
+        message_parts.append(f"Da nap {report['total_chunks']} chunks tu file {ext}.")
+    report["message"] = " ".join(message_parts)
     return report

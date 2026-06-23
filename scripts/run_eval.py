@@ -42,7 +42,7 @@ def run_evaluation():
     level_stats = defaultdict(lambda: {"total": 0, "pass": 0})
 
     with open(output_file, "w", encoding="utf-8") as out:
-        out.write("# 🧪 Kết Quả Đánh Giá RAG Pipeline (Phase 4)\n\n")
+        out.write("#  Kết Quả Đánh Giá RAG Pipeline (Phase 4)\n\n")
         out.write(f"**Tổng số câu hỏi test:** {total_tests}\n\n")
         out.write("---\n\n")
         
@@ -64,7 +64,7 @@ def run_evaluation():
             print(f"Dang chay cau {i+1}/{total_tests}: [{test_id}]...")
             
             out.write(f"### Câu {i+1}: [{test_id}] {level}\n")
-            out.write(f"**❓ Câu hỏi:** {question}\n\n")
+            out.write(f"** Câu hỏi:** {question}\n\n")
             out.write(f"- **Kỳ vọng Keywords:** {expected_keywords}\n")
             if expected_sources: out.write(f"- **Kỳ vọng Sources:** {expected_sources}\n")
             if forbidden_sources: out.write(f"- **Forbidden Sources:** {forbidden_sources}\n")
@@ -158,9 +158,9 @@ def run_evaluation():
                 if is_pass:
                     passed_tests += 1
                     level_stats[level]["pass"] += 1
-                    status_icon = "✅ **PASSED**"
+                    status_icon = " **PASSED**"
                 else:
-                    status_icon = "❌ **FAILED**"
+                    status_icon = " **FAILED**"
                 
                 out.write(f"**Trạng thái:** {status_icon}\n\n")
                 if not is_pass:
@@ -176,16 +176,16 @@ def run_evaluation():
                         out.write(f"- Lỗi: Vi pham Forbidden Source: {violated_sources}\n")
                     out.write("\n")
 
-                out.write(f"**⏱ Thời gian:** {latency:.2f}s\n\n")
-                out.write(f"**🤖 Bot trả lời:**\n> {bot_answer.strip().replace(chr(10), chr(10)+'> ')}\n\n")
+                out.write(f"** Thời gian:** {latency:.2f}s\n\n")
+                out.write(f"** Bot trả lời:**\n> {bot_answer.strip().replace(chr(10), chr(10)+'> ')}\n\n")
                 
                 if ref_text:
-                    out.write(f"**📚 Nguồn trích dẫn (Bot):**\n{ref_text.strip()}\n\n")
+                    out.write(f"** Nguồn trích dẫn (Bot):**\n{ref_text.strip()}\n\n")
                 
                 out.write("---\n")
 
             except Exception as e:
-                out.write(f"**Trạng thái:** ❌ ERROR\n\n")
+                out.write(f"**Trạng thái:**  ERROR\n\n")
                 out.write(f"**Lỗi RAG:** {e}\n\n---\n")
 
         # Summary 
@@ -236,7 +236,7 @@ def run_evaluation():
     print(f"\nDa hoan tat test. Pass {passed_tests}/{total_tests}. Vui long mo file scripts/eval_report.md de xem ket qua chi tiet.")
     
     if overall_failed_threshold:
-        print("\n❌ CI/CD ALERT: Có ít nhất 1 level không đạt ngưỡng threshold yêu cầu.")
+        print("\n CI/CD ALERT: Có ít nhất 1 level không đạt ngưỡng threshold yêu cầu.")
         import sys
         sys.exit(1)
 

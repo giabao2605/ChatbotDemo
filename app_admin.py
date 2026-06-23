@@ -7,12 +7,23 @@ from db_logic import (
     publish_as_new_variant, 
     publish_as_standalone, 
     reject_document,
-    write_audit_log
+    write_audit_log,
+    update_document_full_metadata,
+    delete_document_completely
 )
 
 def run_admin():
     st.title("Duyệt Tài Liệu Đầu Vào (Phase 3 Workflow)")
     st.markdown("Kiểm tra AI Classification và quyết định chiến lược publish (New Version / Variant / Standalone).")
+
+    col_new, col_reset, _col_sp = st.columns([1, 1, 4])
+    with col_new:
+        if st.button(" Thêm file mới", help="Chuyển sang trang upload để nạp bản vẽ mới", use_container_width=True):
+            st.session_state["_goto_page"] = "Chatbot Hỏi Đáp"
+            st.rerun()
+    with col_reset:
+        if st.button(" Làm mới (Reset)", help="Tải lại dữ liệu mới nhất từ database", use_container_width=True):
+            st.rerun()
 
     if engine is None:
         st.error("Không thể kết nối đến Database.")
@@ -62,7 +73,7 @@ def run_admin():
     published_docs = [d for d in all_docs if d[3] == "approved"]
     rejected_docs = [d for d in all_docs if d[3] == "rejected"]
 
-    def render_doc_list(docs, show_actions=False):
+    def render_doc_list(docs, show_actions=False, allow_manage=False):
         if not docs:
             st.info("Không có tài liệu nào trong danh sách này.")
             return
@@ -78,7 +89,7 @@ def run_admin():
                 if class_json:
                     try:
                         cls_data = json.loads(class_json)
-                        st.markdown("### 🤖 AI Classification Đề Xuất:")
+                        st.markdown("###  AI Classification Đề Xuất:")
                         st.info(f"**Action:** `{cls_data.get('detected_action')}` | **Base Code:** `{cls_data.get('base_code')}` | **Confidence:** {class_conf*100 if class_conf else 0:.1f}%")
                         st.write(f"**Lý do AI:** {cls_data.get('reason')}")
                     except Exception as e:
@@ -99,7 +110,7 @@ def run_admin():
                     st.write(f"- **Dung sai:** {dung_sai}")
 
                 if show_actions:
-                    st.markdown("### ✏️ Cập nhật Metadata trước khi Duyệt (Bắt buộc kiểm tra):")
+                    st.markdown("###  Cập nhật Metadata trước khi Duyệt (Bắt buộc kiểm tra):")
                     col_a, col_b = st.columns(2)
                     with col_a:
                         edit_base_code = st.text_input("Base Code", value=t_bc or "", key=f"bc_{doc_id}")
@@ -220,12 +231,56 @@ def run_admin():
                             else:
                                 st.error("Xử lý thất bại. Vui lòng kiểm tra log.")
 
+                if allow_manage:
+                    st.markdown("---")
+                    st.markdown("###  Cập nhật bản vẽ (Update)")
+                    with st.form(key=f"update_form_{doc_id}"):
+                        uc1, uc2 = st.columns(2)
+                        with uc1:
+                            u_bc = st.text_input("Base Code (Mã bản vẽ)", value=t_bc or "", key=f"u_bc_{doc_id}")
+                            u_vn = st.number_input("Version No", value=int(t_vn) if t_vn else 1, step=1, key=f"u_vn_{doc_id}")
+                            u_vl = st.text_input("Version Label", value=t_vl or "", key=f"u_vl_{doc_id}")
+                        with uc2:
+                            u_vc = st.text_input("Variant Code", value=t_vc or "default", key=f"u_vc_{doc_id}")
+                            u_vg = st.text_input("Variant Group", value=t_vg or "", key=f"u_vg_{doc_id}")
+                            u_dt = st.text_input("Document Type", value=loai_tl or "", key=f"u_dt_{doc_id}")
+                        if st.form_submit_button(" Lưu cập nhật bản vẽ", type="primary"):
+                            try:
+                                ok_upd = update_document_full_metadata(
+                                    doc_id, base_code=u_bc, version_no=u_vn, version_label=u_vl,
+                                    variant_code=u_vc, variant_group=u_vg, loai_tai_lieu=u_dt,
+                                    reviewer=current_user["username"]
+                                )
+                                if ok_upd:
+                                    st.success("Đã cập nhật bản vẽ (đồng bộ SQL + Qdrant).")
+                                    st.rerun()
+                                else:
+                                    st.error("Cập nhật Qdrant thất bại. Vui lòng kiểm tra log.")
+                            except Exception as e:
+                                st.error(f"Lỗi khi cập nhật: {e}")
+
+                    st.markdown("###  Xóa bản vẽ (Delete)")
+                    confirm_del = st.checkbox(
+                        "Tôi hiểu thao tác này sẽ xóa VĨNH VIỄN toàn bộ dữ liệu (SQL + vector Qdrant) và không thể khôi phục.",
+                        key=f"confirm_del_{doc_id}"
+                    )
+                    if st.button("Xóa toàn bộ dữ liệu bản vẽ này", key=f"del_{doc_id}", type="secondary", disabled=not confirm_del):
+                        try:
+                            ok_del = delete_document_completely(doc_id, reviewer=current_user["username"])
+                            if ok_del:
+                                st.success(f"Đã xóa toàn bộ dữ liệu của '{ten_file}'.")
+                                st.rerun()
+                            else:
+                                st.error("Xóa thất bại. Vui lòng kiểm tra log.")
+                        except Exception as e:
+                            st.error(f"Lỗi khi xóa: {e}")
+
     with tabs[0]:
         render_doc_list(pending_docs, show_actions=True)
     with tabs[1]:
-        render_doc_list(published_docs, show_actions=False)
+        render_doc_list(published_docs, show_actions=False, allow_manage=True)
     with tabs[2]:
-        render_doc_list(rejected_docs, show_actions=False)
+        render_doc_list(rejected_docs, show_actions=False, allow_manage=True)
     with tabs[3]:
         st.subheader("Phân Loại Lỗi Chatbot (Feedback Loop)")
         with engine.connect() as conn:

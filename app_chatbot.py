@@ -472,7 +472,7 @@ def run_chat():
                 })
                 st.session_state.chat_history.append({
                     "role": "assistant",
-                    "content": "❌ **Từ chối quyền truy cập:** Bạn hiện chỉ có quyền xem (viewer). Bạn không được phép upload file tài liệu (PDF, Word, Excel) vào hệ thống. Bạn chỉ được phép gửi **hình ảnh** (.jpg, .png, .webp) để hỏi Chatbot. Vui lòng thử lại!"
+                    "content": " **Từ chối quyền truy cập:** Bạn hiện chỉ có quyền xem (viewer). Bạn không được phép upload file tài liệu (PDF, Word, Excel) vào hệ thống. Bạn chỉ được phép gửi **hình ảnh** (.jpg, .png, .webp) để hỏi Chatbot. Vui lòng thử lại!"
                 })
                 st.rerun()
 

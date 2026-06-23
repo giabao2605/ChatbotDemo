@@ -38,7 +38,7 @@ if __name__ == "__main__":
         print("Ví dụ:     python scripts/nap_them_file.py To_Han/9.3.03843.pdf")
         sys.exit(0)
 
-    print(f"\n📋 Sẽ nạp thêm {len(danh_sach_file)} file:")
+    print(f"\n Sẽ nạp thêm {len(danh_sach_file)} file:")
     for f in danh_sach_file:
         print(f"   - {f}")
     print()
@@ -63,13 +63,13 @@ if __name__ == "__main__":
         success, msg, _ = learn_new_file(file_path, ten_file, thu_muc=thu_muc, progress_callback=console_progress)
 
         if success:
-            print(f"  ✅ Thành công! {msg}")
+            print(f"   Thành công! {msg}")
             logger.info(f"Nạp thành công {ten_file}: {msg}")
             so_file_thanh_cong += 1
         else:
-            print(f"  ❌ Lỗi: {msg}")
+            print(f"   Lỗi: {msg}")
             logger.error(f"Lỗi nạp file {ten_file}: {msg}")
             so_file_loi += 1
 
     print(f"\n{'='*50}")
-    print(f"HOÀN TẤT! Thành công: {so_file_thanh_cong} | Lỗi: {so_file_loi}")
+    print(f"HOÀN TẤT! Thành công: {so_file_thanh_cong} | Lỗi: {so_file_loi}")

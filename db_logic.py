@@ -979,6 +979,89 @@ def update_qdrant_metadata(doc_id, metadata_updates):
         logger.error(f"Loi update Qdrant payload cho DocID {doc_id}: {e}", exc_info=True)
         return False
 
+def update_document_full_metadata(doc_id, base_code=None, version_no=None, version_label=None,
+                                  variant_code=None, variant_group=None, loai_tai_lieu=None,
+                                  reviewer="System"):
+    """Cap nhat lai 'ma ban ve'/version/variant cho 1 tai lieu da duyet/tu choi.
+    Dong bo ca SQL (TaiLieu + TaiLieuKyThuat + FamilyID) lan Qdrant payload."""
+    _ensure_engine()
+    norm_base = normalize_base_code(base_code) if base_code else base_code
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE TaiLieu
+            SET BaseCode = :bc, VersionNo = :vn, VersionLabel = :vl,
+                VariantCode = :vc, VariantGroup = :vg
+            WHERE DocID = :id
+        """), {"bc": norm_base, "vn": version_no, "vl": version_label,
+               "vc": variant_code, "vg": variant_group, "id": doc_id})
+        if loai_tai_lieu is not None:
+            conn.execute(text("UPDATE TaiLieuKyThuat SET LoaiTaiLieu = :l WHERE DocID = :id"),
+                         {"l": loai_tai_lieu, "id": doc_id})
+        if norm_base:
+            f_row = conn.execute(text("SELECT FamilyID FROM DocumentFamily WHERE BaseCode = :b"), {"b": norm_base}).fetchone()
+            if f_row:
+                conn.execute(text("UPDATE TaiLieu SET FamilyID = :fid WHERE DocID = :id"), {"fid": f_row[0], "id": doc_id})
+            else:
+                conn.execute(text("INSERT INTO DocumentFamily (BaseCode, FamilyName) VALUES (:b, :n)"), {"b": norm_base, "n": f"Family {norm_base}"})
+                f_row2 = conn.execute(text("SELECT FamilyID FROM DocumentFamily WHERE BaseCode = :b"), {"b": norm_base}).fetchone()
+                conn.execute(text("UPDATE TaiLieu SET FamilyID = :fid WHERE DocID = :id"), {"fid": f_row2[0], "id": doc_id})
+
+    qmeta = {}
+    if norm_base is not None: qmeta["base_code"] = norm_base
+    if version_no is not None: qmeta["version_no"] = version_no
+    if variant_code is not None: qmeta["variant_code"] = variant_code
+    if variant_group is not None: qmeta["variant_group"] = variant_group
+    if loai_tai_lieu is not None: qmeta["loai_tai_lieu"] = loai_tai_lieu
+
+    ok = update_qdrant_metadata(doc_id, qmeta) if qmeta else True
+    write_audit_log(reviewer, "update_metadata", "TaiLieu", doc_id,
+                    {"base_code": norm_base, "version": version_no, "variant": variant_code})
+    return ok
+
+
+def delete_document_completely(doc_id, reviewer="System"):
+    """Xoa VINH VIEN toan bo du lieu cua 1 tai lieu:
+    - Qdrant vectors (theo metadata.doc_id)
+    - SQL: TaiLieu (keo theo TaiLieuKyThuat + BangKeVatTu nho ON DELETE CASCADE)
+    - IngestionJobs (theo TenFile + ThuMuc)
+    Tra ve True neu thanh cong."""
+    _ensure_engine()
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT TenFile, ThuMuc FROM TaiLieu WHERE DocID = :id"), {"id": doc_id}).fetchone()
+    if not row:
+        logger.warning(f"delete_document_completely: khong tim thay DocID {doc_id}")
+        return False
+    ten_file, thu_muc = row[0], row[1]
+
+    try:
+        from qdrant_client import models
+        client = _get_qdrant_client()
+        client.delete(
+            collection_name="TaiLieuKyThuat_v2",
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[models.FieldCondition(key="metadata.doc_id", match=models.MatchValue(value=doc_id))]
+                )
+            )
+        )
+        logger.info(f"Da xoa Qdrant points cho DocID {doc_id}")
+    except Exception as e:
+        logger.error(f"Loi xoa Qdrant points cho DocID {doc_id}: {e}", exc_info=True)
+        return False
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM TaiLieu WHERE DocID = :id"), {"id": doc_id})
+            if ten_file and thu_muc:
+                conn.execute(text("DELETE FROM dbo.IngestionJobs WHERE TenFile = :f AND ThuMuc = :t"),
+                             {"f": ten_file, "t": thu_muc})
+    except Exception as e:
+        logger.error(f"Loi xoa SQL cho DocID {doc_id}: {e}", exc_info=True)
+        return False
+
+    write_audit_log(reviewer, "delete_document", "TaiLieu", doc_id, {"ten_file": ten_file, "thu_muc": thu_muc})
+    return True
+
 def get_doc(doc_id):
     _ensure_engine()
     with engine.connect() as conn:
@@ -1206,4 +1289,4 @@ def rollback_to_version_by_family(family_id, version_no, variant_code="default",
     except Exception as e:
         logger.error(f"Loi rollback_to_version_by_family: {e}", exc_info=True)
         return False
-
+

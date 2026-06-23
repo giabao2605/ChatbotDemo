@@ -23,7 +23,13 @@ if auth.has_role("uploader") or auth.has_role("admin"):
 if auth.has_role("reviewer") or auth.has_role("admin"):
     menu_options.append("Duyệt Tài Liệu")
 
-page = st.sidebar.radio("Chuyển trang", menu_options)
+# Cho phép điều hướng bằng code (ví dụ nút "Thêm file mới" ở trang Duyệt Tài Liệu)
+if "_goto_page" in st.session_state:
+    _target = st.session_state.pop("_goto_page")
+    if _target in menu_options:
+        st.session_state["nav_page"] = _target
+
+page = st.sidebar.radio("Chuyển trang", menu_options, key="nav_page")
 
 if page == "Chatbot Hỏi Đáp":
     import app_chatbot

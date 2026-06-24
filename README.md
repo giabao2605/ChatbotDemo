@@ -77,8 +77,10 @@ This will launch:
 
 **Option B: Running Locally (Development)**
 
-1. Install dependencies:
+1. Clone and install dependencies:
 ```bash
+git clone https://github.com/giabao2605/ChatbotProject.git
+cd ChatbotProject
 pip install -r requirements-core.txt
 ```
 2. Start the FastAPI RAG server:

@@ -4,7 +4,7 @@ import sys
 # Add root folder to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
-from db_logic import engine, text
+from mech_chatbot.db.repository import engine, text
 
 def run_migration():
     if engine is None:

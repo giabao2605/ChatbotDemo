@@ -1,5 +1,5 @@
-from db_logic import engine
-from rag_logic import client
+from mech_chatbot.db.repository import engine
+from mech_chatbot.rag.service import client
 from sqlalchemy import text
 
 # Kiểm tra SQL

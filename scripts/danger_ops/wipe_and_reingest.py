@@ -1,4 +1,4 @@
-import os
+﻿import os
 import time
 import sys
 from sqlalchemy import text
@@ -53,8 +53,8 @@ finally:
     time.sleep(1)
 
 print("2. Dang import module va xoa SQL Data...")
-from db_logic import engine
-from file_learning import learn_new_file
+from mech_chatbot.db.repository import engine
+from mech_chatbot.ingestion.file_ingestor import learn_new_file
 
 print("2. Dang xoa du lieu SQL Server (TaiLieu, TaiLieuKyThuat)...")
 try:
@@ -70,7 +70,7 @@ except Exception as e:
 print("2b. Dang xoa file anh cu trong Data_Anh_Da_Tach...")
 import shutil
 base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-anh_dir = os.path.join(base_dir, "Data_Anh_Da_Tach")
+anh_dir = os.path.join(base_dir, "data", "processed")
 if os.path.exists(anh_dir):
     try:
         shutil.rmtree(anh_dir)
@@ -89,7 +89,7 @@ else:
 def reingest_all():
     print("\n3. Bat dau Re-ingest toan bo tu thu muc Data_Goc...")
     base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    data_goc_path = os.path.join(base_dir, "Data_Goc")
+    data_goc_path = os.path.join(base_dir, "data", "raw")
 
     if not os.path.exists(data_goc_path):
         print(f"Khong tim thay thu muc: {data_goc_path}")

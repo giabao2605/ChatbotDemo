@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Import rag_logic se trigger viec ensure_schema
-from rag_logic import client
+from mech_chatbot.rag.service import client
 
 try:
     info = client.get_collection("TaiLieuKyThuat_v2")

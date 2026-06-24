@@ -6,22 +6,20 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
-# Databases & Media
-Mechanical_Qdrant_DB/
-Data_Anh_Da_Tach/
-Data_Goc/
+# Data (raw & processed)
+data/raw/
+data/processed/
 
 # Logs & Temp
 logs/
 temp_logs/
 *.log
-!requirements.txt
 
 # Secrets
 .env
 .streamlit/secrets.toml
 
-# Debug & Temp scripts (không commit)
+# Debug & Temp scripts
 debug*.py
 debug*.txt
 temp_*.py
@@ -32,6 +30,10 @@ plot.log
 .vscode/
 .idea/
 Thumbs.db
-check_qdrant_count.py
+
+# Temp RAG worker files
 rag_in_*.json
 rag_out_*.json
+
+# Refactor script (one-time use)
+refactor_project.py

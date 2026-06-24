@@ -5,7 +5,7 @@ import os
 # Add parent dir to path so we can import db_logic
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from db_logic import engine
+from mech_chatbot.db.repository import engine
 
 def migrate_phase3():
     queries = [

@@ -1,4 +1,4 @@
-import os
+﻿import os
 import shutil
 import glob
 from sqlalchemy import text
@@ -9,7 +9,7 @@ load_dotenv()
 
 # Thêm đường dẫn gốc để import db_logic
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from db_logic import engine
+from mech_chatbot.db.repository import engine
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -17,7 +17,7 @@ def reset_all_data():
     print("BẮT ĐẦU XÓA TOÀN BỘ DỮ LIỆU...")
 
     # 1. Xóa ảnh trong Data_Anh_Da_Tach
-    anh_dir = os.path.join(BASE_DIR, "Data_Anh_Da_Tach")
+    anh_dir = os.path.join(BASE_DIR, "data", "processed")
     if os.path.exists(anh_dir):
         files = glob.glob(os.path.join(anh_dir, "*"))
         for f in files:
@@ -28,7 +28,7 @@ def reset_all_data():
         print(f"Đã xóa toàn bộ ảnh trong {anh_dir}")
 
     # 2. Xóa các file PDF user đã tải lên qua UI (nếu có)
-    tu_hoc_dir = os.path.join(BASE_DIR, "Data_Goc", "Tu_Hoc")
+    tu_hoc_dir = os.path.join(BASE_DIR, "data", "raw", "Tu_Hoc")
     if os.path.exists(tu_hoc_dir):
         files = glob.glob(os.path.join(tu_hoc_dir, "*.pdf"))
         for f in files:

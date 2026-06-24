@@ -30,21 +30,25 @@ An advanced Retrieval-Augmented Generation (RAG) chatbot purpose-built for the m
 ```text
 ChatBotProject/
 ├── .env                  # Environment variables (API keys, DB connections)
-├── docker-compose.yml    # Container orchestration for UI, API, and Worker
-├── app.py                # Main Streamlit UI entry point (Routing & Auth)
-├── app_chatbot.py        # User-facing chat interface
-├── app_admin.py          # Administrator dashboard for document approval/ingestion
-├── app_queue.py          # Task queue & ingestion progress monitoring
-├── rag_server.py         # FastAPI application for persistent RAG processing
-├── scripts/
-│   └── ingestion_worker.py # Background daemon processing pending PDF jobs
-├── pdf_processor.py      # Core logic for PDF extraction and Vision OCR
-├── rag_logic.py          # Retrieval, generation, and anti-hallucination logic
-├── db_logic.py           # SQL Server models, migrations, and operations
-├── llm_client.py         # Resilient LangChain wrapper for LLM calls
-├── gemini_client.py      # OpenAI-compatible Vision API client (Legacy name)
-├── Mech_Chatbot_DB.sql   # SQL Server database initialization script
-└── requirements-core.txt # Python dependencies
+├── docker/
+│   └── docker-compose.yml # Container orchestration for UI, API, and Worker
+├── run.py                # Main Streamlit UI entry point (streamlit run run.py)
+├── src/mech_chatbot/     # Core application source code
+│   ├── ui/               # Streamlit UI pages and themes
+│   │   └── app.py        # Streamlit router
+│   ├── api/              # FastAPI application for persistent RAG processing
+│   │   └── rag_server.py
+│   ├── workers/          # Background daemon processing pending PDF jobs
+│   │   └── ingestion_worker.py
+│   ├── ingestion/        # Core logic for PDF extraction and Vision OCR
+│   ├── rag/              # Retrieval, generation, and anti-hallucination logic
+│   │   └── service.py
+│   ├── db/               # SQL Server models, migrations, and operations
+│   │   └── repository.py
+│   └── llm/              # LLM clients (OpenAI-compatible / ProxyLLM)
+├── data/                 # Raw and processed document data
+├── database/             # SQL Server database initialization scripts
+└── requirements.txt      # Python dependencies
 ```
 
 ## Getting Started
@@ -68,7 +72,7 @@ ChatBotProject/
 **Option A: Using Docker Compose (Recommended)**
 
 ```bash
-docker-compose up -d --build
+docker-compose -f docker/docker-compose.yml up -d --build
 ```
 This will launch:
 - The Streamlit UI on `http://localhost:8501`
@@ -81,19 +85,19 @@ This will launch:
 ```bash
 git clone https://github.com/giabao2605/ChatbotProject.git
 cd ChatbotProject
-pip install -r requirements-core.txt
+pip install -r requirements.txt
 ```
 2. Start the FastAPI RAG server:
 ```bash
-python rag_server.py
+python -m mech_chatbot.api.rag_server
 ```
 3. Start the Background Ingestion worker:
 ```bash
-python scripts/ingestion_worker.py
+python -m mech_chatbot.workers.ingestion_worker
 ```
 4. Start the Streamlit UI (in a separate terminal):
 ```bash
-streamlit run app.py
+streamlit run run.py
 ```
 
 ### 4. Application Modules

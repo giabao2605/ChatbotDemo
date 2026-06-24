@@ -1,4 +1,4 @@
-"""
+﻿"""
 Script nạp thêm file vào Qdrant từ command line.
 Hỗ trợ mọi định dạng: PDF, DOCX, XLSX, CSV, TXT, ảnh...
 
@@ -18,12 +18,12 @@ if sys.stdout.encoding != 'utf-8':
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 load_dotenv()
 
-from logger_config import logger
-from file_learning import learn_new_file  # Dùng learn_new_file để hỗ trợ multi-format
+from mech_chatbot.config.logging import logger
+from mech_chatbot.ingestion.file_ingestor import learn_new_file  # Dùng learn_new_file để hỗ trợ multi-format
 
 # BASE_DIR trỏ đúng về project root (không phải scripts/)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE_DIR, "Data_Goc")
+DATA_DIR = os.path.join(BASE_DIR, "data", "raw")
 
 def console_progress(msg):
     print(f"  {msg}")
@@ -55,7 +55,7 @@ if __name__ == "__main__":
             so_file_loi += 1
             continue
 
-        thu_muc = os.path.basename(os.path.dirname(file_path)) or "Data_Goc"
+        thu_muc = os.path.basename(os.path.dirname(file_path)) or "data", "raw"
         ten_file = os.path.basename(file_path)
         print(f"\n=== ĐANG XỬ LÝ: {ten_file} (Thư mục: {thu_muc}) ===")
         logger.info(f"Đang xử lý file: {ten_file}")

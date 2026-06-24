@@ -6,7 +6,7 @@ from sqlalchemy import text
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from db_logic import engine
+from mech_chatbot.db.repository import engine
 from qdrant_client import QdrantClient
 
 def check_coverage():

@@ -1,4 +1,4 @@
-import os
+﻿import os
 import shutil
 import sys
 from sqlalchemy import text
@@ -24,7 +24,7 @@ except Exception as e:
     print(f" -> Loi hoac collection khong ton tai: {e}")
 
 print("2. Dang xoa du lieu SQL Server (TaiLieu, TaiLieuKyThuat)...")
-from db_logic import engine
+from mech_chatbot.db.repository import engine
 try:
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM BangKeVatTu"))
@@ -42,7 +42,7 @@ except Exception as e:
 
 print("3. Dang xoa file anh trong Data_Anh_Da_Tach...")
 base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-anh_dir = os.path.join(base_dir, "Data_Anh_Da_Tach")
+anh_dir = os.path.join(base_dir, "data", "processed")
 if os.path.exists(anh_dir):
     try:
         shutil.rmtree(anh_dir)

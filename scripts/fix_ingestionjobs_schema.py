@@ -4,7 +4,7 @@ from sqlalchemy import text
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from db_logic import engine
+from mech_chatbot.db.repository import engine
 
 def fix_ingestionjobs_schema():
     if engine is None:

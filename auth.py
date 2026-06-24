@@ -1,5 +1,8 @@
+from pathlib import Path
+
 import bcrypt
 import streamlit as st
+import streamlit.components.v1 as components
 from sqlalchemy import text
 from db_logic import engine
 
@@ -79,21 +82,63 @@ def authenticate_user(username, password):
         st.error(f"Lỗi truy vấn: {e}")
         return None
 
+_LIQUID_LOGIN_COMPONENT = components.declare_component(
+    "liquid_login",
+    path=str(Path(__file__).parent / "components" / "liquid_login"),
+)
+
+
+def _inject_login_page_css():
+    """Chỉ reset layout Streamlit; hiệu ứng login nằm nguyên trong custom component."""
+    st.markdown(
+        """
+        <style>
+        /* Giữ nền mặc định của Streamlit, chỉ reset layout cho trang login */
+        [data-testid="stAppViewContainer"] .block-container {
+            max-width: 100% !important;
+            padding: 0 !important;
+            margin: 0 !important;
+        }
+        [data-testid="stVerticalBlock"],
+        [data-testid="element-container"],
+        .stCustomComponentV1 {
+            height: 100vh !important;
+            min-height: 100vh !important;
+            padding: 0 !important;
+            margin: 0 !important;
+        }
+        iframe {
+            display: block !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            min-height: 100vh !important;
+            border: none !important;
+            background: transparent !important;
+        }
+        header[data-testid="stHeader"] { background: transparent; }
+        #MainMenu, footer { visibility: hidden; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
 def login_screen():
-    st.title("Hệ Thống RAG Cơ Khí - Đăng Nhập")
-    with st.form("login_form"):
-        username = st.text_input("Tên đăng nhập")
-        password = st.text_input("Mật khẩu", type="password")
-        submit = st.form_submit_button("Đăng Nhập")
-        
-        if submit:
-            user_data = authenticate_user(username, password)
-            if user_data:
-                st.session_state["user"] = user_data
-                # Không rerun tại đây; app.py sẽ tiếp tục render sau khi check_auth() thành công.
-                return True
-            st.error("Sai tên đăng nhập hoặc mật khẩu, hoặc tài khoản bị khóa.")
-            return False
+    _inject_login_page_css()
+
+    error_message = st.session_state.pop("login_error", "")
+    result = _LIQUID_LOGIN_COMPONENT(error=error_message, default=None, key="liquid_login")
+
+    if result and result.get("submittedAt"):
+        username = (result.get("username") or "").strip()
+        password = result.get("password") or ""
+        user_data = authenticate_user(username, password)
+        if user_data:
+            st.session_state["user"] = user_data
+            st.rerun()
+
+        st.session_state["login_error"] = "Sai tên đăng nhập hoặc mật khẩu, hoặc tài khoản bị khóa."
+        st.rerun()
+
     return False
 
 def check_auth():

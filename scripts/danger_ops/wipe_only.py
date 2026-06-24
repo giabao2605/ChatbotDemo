@@ -32,7 +32,10 @@ try:
         conn.execute(text("DELETE FROM TechnicalAttributes"))
         conn.execute(text("DELETE FROM TaiLieuKyThuat"))
         conn.execute(text("DELETE FROM TaiLieu"))
+        conn.execute(text("DELETE FROM DocumentFamily"))
         conn.execute(text("DELETE FROM IngestionJobs"))
+        conn.execute(text("DELETE FROM LichSuChat"))
+        conn.execute(text("DELETE FROM FeedbackReview"))
     print(" -> Da don dep SQL Server thanh cong.")
 except Exception as e:
     print(f" -> Loi xoa SQL Server: {e}")

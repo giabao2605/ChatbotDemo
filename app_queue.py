@@ -14,6 +14,12 @@ def run_queue():
     current_user = auth.get_current_user()
     is_admin = auth.has_role("admin")
 
+    status_filter = st.selectbox(
+        "Trạng thái",
+        ["Tất cả", "pending", "pending_retry", "classifying", "extracting", "embedding", "failed", "waiting_quota"],
+    )
+    search = st.text_input("Tìm file")
+
     try:
         with engine.connect() as conn:
             query_str = """
@@ -26,6 +32,12 @@ def run_queue():
             WHERE Status NOT IN ('pending_review', 'published', 'rejected', 'archived', 'superseded')
             """
             params = {}
+            if status_filter != "Tất cả":
+                query_str += " AND Status = :status"
+                params["status"] = status_filter
+            if search:
+                query_str += " AND TenFile LIKE :search"
+                params["search"] = f"%{search}%"
             if not is_admin:
                 query_str += " AND (ThuMuc = :dept OR UploadedBy = :uname)"
                 params["dept"] = current_user["department"]
@@ -65,6 +77,7 @@ def run_queue():
             with st.expander(f"[{status.upper()}] {ten_file} (Job: {job_id}) - {created_at.strftime('%Y-%m-%d %H:%M:%S')}"):
                 st.write(f"**Thư mục:** {thu_muc} | **Người tải lên:** {uploaded_by or 'Unknown'}")
                 st.write(f"**Trạng thái:** <span style='color:{color}'>{status}</span> (Tiến độ: {progress_percent}%)", unsafe_allow_html=True)
+                st.progress((progress_percent or 0) / 100)
                 st.write(f"**Debug Info:** Retry: {retry_count}/{max_retry} | LockedBy: {locked_by} at {locked_at}")
                 st.write(f"**Failure Type:** {failure_type or 'N/A'}")
                 st.write(f"**Next Retry At:** {next_retry_at or 'N/A'}")

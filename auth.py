@@ -160,3 +160,19 @@ def logout():
     if "user" in st.session_state:
         del st.session_state["user"]
     st.rerun()
+
+
+
+def is_admin():
+    return has_role("admin")
+
+
+def get_allowed_departments():
+    user = get_current_user()
+    if not user:
+        return []
+    allowed = list(user.get("allowed_departments") or [])
+    dept = user.get("department")
+    if dept and dept not in allowed:
+        allowed.append(dept)
+    return allowed

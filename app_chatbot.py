@@ -246,6 +246,10 @@ def run_chat():
         st.session_state.session_id = str(uuid.uuid4())
     if "current_part_ids" not in st.session_state:
         st.session_state.current_part_ids = []
+
+    import auth
+    current_user = auth.get_current_user()
+    is_admin = auth.has_role("admin")
  
     # ==========================================
     # 3. SIDEBAR - CONG CU PHU TRO
@@ -293,7 +297,7 @@ def run_chat():
         search_query = st.text_input("Tim kiem lich su", "")
  
         # Danh sach cac phien chat cu
-        sessions = get_all_sessions()
+        sessions = get_all_sessions(username=current_user["username"], is_admin=is_admin)
  
         # Loc danh sach theo tu khoa tim kiem
         if search_query:
@@ -325,11 +329,11 @@ def run_chat():
                 with col1:
                     if st.button(label, key=f"btn_chat_{s['session_id']}", use_container_width=True, type=btn_type):
                         st.session_state.session_id = s['session_id']
-                        st.session_state.chat_history = get_chat_history(s['session_id'])
+                        st.session_state.chat_history = get_chat_history(s['session_id'], username=current_user["username"], is_admin=is_admin)
                         st.rerun()
                 with col2:
                     if st.button("X", key=f"btn_del_{s['session_id']}", help="Xoa", use_container_width=True):
-                        clear_chat_history(s['session_id'])
+                        clear_chat_history(s['session_id'], username=current_user["username"], is_admin=is_admin)
                         if is_current:
                             st.session_state.session_id = str(uuid.uuid4())
                             st.session_state.chat_history = []
@@ -437,10 +441,9 @@ def run_chat():
     current_user = auth.get_current_user()
     can_upload = auth.has_role("uploader") or auth.has_role("admin")
 
-    # Xu ly nhap cau hoi
-    allowed_types = UPLOAD_FILE_TYPES if can_upload else [
-        ext.lstrip(".") for ext in IMAGE_QUESTION_EXTENSIONS
-    ]
+    # Upload tài liệu PDF/Word/Excel đã được tách sang trang "Tải tài liệu".
+    # Trang chatbot chỉ nhận ảnh để hỏi/phân tích cùng câu hỏi RAG.
+    allowed_types = [ext.lstrip(".") for ext in IMAGE_QUESTION_EXTENSIONS]
 
     uploaded_files = st.file_uploader(
         "Tải file lên nếu cần",
@@ -490,7 +493,7 @@ def run_chat():
                     is_learning_batch = True
                     break
  
-        if is_learning_batch:
+        if False and is_learning_batch:
             # --- LUONG HOC TAI LIEU MOI (HO TRO NHIEU FILE) ---
             file_names = [f.name for f in uploaded_files]
             file_names_str = ", ".join(file_names)
@@ -542,7 +545,8 @@ def run_chat():
                 chat_id = save_chat_history(
                     session_id=st.session_state.session_id,
                     user_msg=f"Hay hoc cac tai lieu nay: {file_names_str}",
-                    bot_msg=final_bot_msg
+                    bot_msg=final_bot_msg,
+                    username=current_user["username"]
                 )
                 st.session_state.chat_history.append({
                     "role": "assistant",
@@ -660,7 +664,8 @@ def run_chat():
                 user_msg=prompt,
                 bot_msg=raw_response,
                 image_path=saved_img_path,
-                ref_images=ref_images  # FIX C5: luu danh sach duong dan ban ve can cu
+                ref_images=ref_images,  # FIX C5: luu danh sach duong dan ban ve can cu
+                username=current_user["username"]
             )
             
             # Log audit

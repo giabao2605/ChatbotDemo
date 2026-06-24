@@ -116,7 +116,24 @@ def _cap_len(val, max_len):
 # ==========================================
 # CHAT HISTORY
 # ==========================================
-def save_chat_history(session_id, user_msg, bot_msg, image_path=None, ref_images=None):
+def _chat_history_has_username_column():
+    """Return True when dbo.LichSuChat has Username column.
+
+    This keeps the app backward-compatible before the SQL migration is run.
+    """
+    _ensure_engine()
+    try:
+        with engine.connect() as conn:
+            val = conn.execute(
+                text("SELECT COL_LENGTH('dbo.LichSuChat', 'Username')")
+            ).scalar()
+            return val is not None
+    except Exception as e:
+        logger.warning(f"Khong kiem tra duoc cot Username trong LichSuChat: {e}")
+        return False
+
+
+def save_chat_history(session_id, user_msg, bot_msg, image_path=None, ref_images=None, username=None):
     _ensure_engine()
     try:
         # FIX C5: serialize danh sach duong dan ban ve can cu thanh JSON string de luu DB
@@ -126,49 +143,82 @@ def save_chat_history(session_id, user_msg, bot_msg, image_path=None, ref_images
         user_msg = _cap_len(user_msg, MAX_USER_MSG_LEN)
         bot_msg = _cap_len(bot_msg, MAX_BOT_MSG_LEN)
         image_path = _cap_len(image_path, 500)
+        username = _cap_len(username, 255)
+        has_username_col = _chat_history_has_username_column()
+
         with engine.begin() as conn:
-            query = text(
-                """
-                INSERT INTO LichSuChat (SessionID, CauHoi_User, TraLoi_Bot, HinhAnhUpload, RefImages)
-                OUTPUT INSERTED.ChatID
-                VALUES (:session_id, :user_msg, :bot_msg, :image_path, :ref_images)
-                """
-            )
-            result = conn.execute(
-                query,
-                {
+            if has_username_col:
+                query = text(
+                    """
+                    INSERT INTO LichSuChat (SessionID, CauHoi_User, TraLoi_Bot, HinhAnhUpload, RefImages, Username)
+                    OUTPUT INSERTED.ChatID
+                    VALUES (:session_id, :user_msg, :bot_msg, :image_path, :ref_images, :username)
+                    """
+                )
+                params = {
                     "session_id": session_id,
                     "user_msg": user_msg,
                     "bot_msg": bot_msg,
                     "image_path": image_path,
                     "ref_images": ref_images_json,
-                },
-            )
+                    "username": username,
+                }
+            else:
+                query = text(
+                    """
+                    INSERT INTO LichSuChat (SessionID, CauHoi_User, TraLoi_Bot, HinhAnhUpload, RefImages)
+                    OUTPUT INSERTED.ChatID
+                    VALUES (:session_id, :user_msg, :bot_msg, :image_path, :ref_images)
+                    """
+                )
+                params = {
+                    "session_id": session_id,
+                    "user_msg": user_msg,
+                    "bot_msg": bot_msg,
+                    "image_path": image_path,
+                    "ref_images": ref_images_json,
+                }
+
+            result = conn.execute(query, params)
             row = result.fetchone()
             return row[0] if row else None
     except Exception as e:
         logger.error(f"Loi khi luu lich su chat: {e}", exc_info=True)
         return None
  
-def get_all_sessions():
-    """Fix #2: Lay cau hoi DAU TIEN theo thoi gian (khong dung MIN tren text)."""
+
+def get_all_sessions(username=None, is_admin=False):
+    """Lay danh sach session chat.
+
+    - Neu da chay migration them cot Username: user thuong chi thay session cua minh.
+    - Admin thay toan bo.
+    - Neu chua co cot Username: fallback ve hanh vi cu de app khong bi loi.
+    """
     _ensure_engine()
     try:
+        has_username_col = _chat_history_has_username_column()
+        params = {}
+        where_clause = ""
+        if has_username_col and not is_admin:
+            where_clause = "WHERE Username = :username"
+            params["username"] = username
+
         with engine.connect() as conn:
             query = text(
-                """
+                f"""
                 SELECT SessionID, ThoiGianBatDau, CauHoiDauTien FROM (
                     SELECT SessionID,
                            CauHoi_User AS CauHoiDauTien,
                            ThoiGian AS ThoiGianBatDau,
                            ROW_NUMBER() OVER (PARTITION BY SessionID ORDER BY ThoiGian ASC, ChatID ASC) AS rn
                     FROM LichSuChat
+                    {where_clause}
                 ) t
                 WHERE rn = 1
                 ORDER BY ThoiGianBatDau DESC
                 """
             )
-            result = conn.execute(query)
+            result = conn.execute(query, params)
             sessions = result.fetchall()
             out = []
             for row in sessions:
@@ -183,19 +233,29 @@ def get_all_sessions():
         logger.error(f"Loi khi lay danh sach session: {e}", exc_info=True)
         return []
  
-def get_chat_history(session_id):
+
+def get_chat_history(session_id, username=None, is_admin=False):
+    """Lay noi dung mot session chat, co loc user neu da co cot Username."""
     _ensure_engine()
     try:
+        has_username_col = _chat_history_has_username_column()
+        params = {"session_id": session_id}
+        user_filter = ""
+        if has_username_col and not is_admin:
+            user_filter = "AND Username = :username"
+            params["username"] = username
+
         with engine.connect() as conn:
             query = text(
-                """
+                f"""
                 SELECT ChatID, CauHoi_User, TraLoi_Bot, HinhAnhUpload, DanhGia, RefImages
                 FROM LichSuChat
                 WHERE SessionID = :session_id
+                {user_filter}
                 ORDER BY ThoiGian ASC, ChatID ASC
                 """
             )
-            rows = conn.execute(query, {"session_id": session_id}).fetchall()
+            rows = conn.execute(query, params).fetchall()
             history = []
             for row in rows:
                 # FIX C5: doc lai ref_images tu DB (JSON string -> list duong dan)
@@ -218,11 +278,29 @@ def get_chat_history(session_id):
         logger.error(f"Loi khi lay lich su chat: {e}", exc_info=True)
         return []
  
-def clear_chat_history(session_id):
+
+def clear_chat_history(session_id, username=None, is_admin=False):
+    """Xoa session chat, user thuong chi xoa duoc session cua minh neu co cot Username."""
     _ensure_engine()
     try:
+        has_username_col = _chat_history_has_username_column()
+        params = {"session_id": session_id}
+        user_filter = ""
+        if has_username_col and not is_admin:
+            user_filter = "AND Username = :username"
+            params["username"] = username
+
         with engine.begin() as conn:
-            conn.execute(text("DELETE FROM LichSuChat WHERE SessionID = :session_id"), {"session_id": session_id})
+            conn.execute(
+                text(
+                    f"""
+                    DELETE FROM LichSuChat
+                    WHERE SessionID = :session_id
+                    {user_filter}
+                    """
+                ),
+                params,
+            )
     except Exception as e:
         logger.error(f"Loi khi xoa lich su chat: {e}", exc_info=True)
  

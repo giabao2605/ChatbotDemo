@@ -1051,6 +1051,10 @@ def delete_document_completely(doc_id, reviewer="System"):
 
     try:
         with engine.begin() as conn:
+            # 2 bang nay KHONG co FK CASCADE toi TaiLieu -> phai xoa thu cong
+            conn.execute(text("DELETE FROM DocumentPages WHERE DocID = :id"), {"id": doc_id})
+            conn.execute(text("DELETE FROM TechnicalAttributes WHERE DocID = :id"), {"id": doc_id})
+            # TaiLieuKyThuat + BangKeVatTu tu dong xoa theo nho ON DELETE CASCADE
             conn.execute(text("DELETE FROM TaiLieu WHERE DocID = :id"), {"id": doc_id})
             if ten_file and thu_muc:
                 conn.execute(text("DELETE FROM dbo.IngestionJobs WHERE TenFile = :f AND ThuMuc = :t"),

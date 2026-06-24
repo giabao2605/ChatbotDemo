@@ -5,96 +5,130 @@ An advanced Retrieval-Augmented Generation (RAG) chatbot purpose-built for the m
 ## Key Features
 
 - **Advanced Document Processing:** Automatically parses complex mechanical engineering PDFs, extracting text, tables, and technical drawings.
-- **Structured Vision OCR:** Utilizes the Google Gemini Vision API to extract and format technical tables and Bills of Materials (BOMs) into a strict, schema-enforced structure (`BangKeVatTu`).
-- **Cloud-Native Vector Search:** Integrated with **Qdrant Cloud** for high-performance, scalable semantic search.
-- **Robust Relational Metadata:** Uses **SQL Server** to maintain rich metadata, document relationships, and persistent chat history with image citations.
+- **Structured Vision OCR:** Utilizes GPT-5.4 Vision (OpenAI-compatible) to extract and format technical tables and Bills of Materials (BOMs) into a strict, schema-enforced structure (`BangKeVatTu`).
+- **Persistent FastAPI RAG Backend:** A decoupled, high-performance API server (`rag_server.py`) that loads models into memory once, ensuring low latency and controlled concurrency for concurrent chat requests.
+- **Asynchronous Ingestion Pipeline:** A dedicated background worker (`ingestion_worker.py`) handles heavy document processing, OCR, and embedding generation asynchronously via a managed task queue.
+- **Role-Based Access Control (RBAC):** Built-in authentication supporting distinct roles (Admin, Reviewer, Uploader, User) for secure document ingestion, data reviewing, and chat interactions.
 - **Anti-Hallucination Guardrails:** Implements a strict "evidence-based" verification layer. The chatbot refuses to guess or hallucinate quantitative data (like fabrication time or costs) if the evidence is missing from the retrieved context.
 - **Visual Citations:** Provides explicit reference images in the chat interface so users can verify the source of the information.
-- **Multi-App Interface:** Built with **Streamlit**, featuring dedicated portals for users and administrators.
+- **Multi-App Interface:** Built with **Streamlit**, featuring dedicated portals for conversational chat, task queue management, and administrator approval workflows.
+- **Docker Compose Ready:** Supports easy deployment of the entire microservices stack (Frontend, API Backend, Worker).
 
 ## Technology Stack
 
-- **Language:** Python 3
+- **Language:** Python 3.9+
 - **Frontend / UI:** [Streamlit](https://streamlit.io/)
-- **LLM & Vision:** [Google Gemini API](https://deepmind.google/technologies/gemini/)
+- **API Backend:** [FastAPI](https://fastapi.tiangolo.com/) & Uvicorn
+- **LLM & Vision:** GPT-5.4 / OpenAI-Compatible endpoints (via LangChain)
+- **Embeddings:** BAAI/bge-m3 (via sentence-transformers)
 - **Vector Database:** [Qdrant Cloud](https://qdrant.tech/)
 - **Relational Database:** Microsoft SQL Server
-- **Key Libraries:** `PyMuPDF` (PDF processing), `qdrant-client`, `pyodbc` (SQL connection)
+- **Key Libraries:** `PyMuPDF`, `LangChain`, `SQLAlchemy`, `Tenacity`, `Docker`
 
 ## Project Structure
 
 ```text
 ChatBotProject/
 ├── .env                  # Environment variables (API keys, DB connections)
-├── app.py                # Main entry point for the Streamlit app
+├── docker-compose.yml    # Container orchestration for UI, API, and Worker
+├── app.py                # Main Streamlit UI entry point (Routing & Auth)
 ├── app_chatbot.py        # User-facing chat interface
-├── app_admin.py          # Administrator dashboard for document ingestion
-├── app_queue.py          # Task queue management interface
-├── pdf_processor.py      # Core logic for PDF extraction and Gemini Vision OCR
+├── app_admin.py          # Administrator dashboard for document approval/ingestion
+├── app_queue.py          # Task queue & ingestion progress monitoring
+├── rag_server.py         # FastAPI application for persistent RAG processing
+├── scripts/
+│   └── ingestion_worker.py # Background daemon processing pending PDF jobs
+├── pdf_processor.py      # Core logic for PDF extraction and Vision OCR
 ├── rag_logic.py          # Retrieval, generation, and anti-hallucination logic
-├── db_logic.py           # SQL Server operations and schema management
-├── gemini_client.py      # Wrapper for Gemini API interactions
+├── db_logic.py           # SQL Server models, migrations, and operations
+├── llm_client.py         # Resilient LangChain wrapper for LLM calls
+├── gemini_client.py      # OpenAI-compatible Vision API client (Legacy name)
 ├── Mech_Chatbot_DB.sql   # SQL Server database initialization script
-└── requirements.txt      # Python dependencies
+└── requirements-core.txt # Python dependencies
 ```
 
 ## Getting Started
 
 ### 1. Prerequisites
 
-- Python 3.9+
+- Python 3.9+ (if running locally without Docker)
+- Docker & Docker Compose (Optional, but recommended)
 - Microsoft SQL Server
 - Qdrant Cloud Account
-- Google Gemini API Key
+- OpenAI-compatible API Key (e.g., ProxyLLM or GPT-4/5)
 
-### 2. Installation
+### 2. Database Setup
 
-Clone the repository and install the required dependencies:
+1. Execute the `Mech_Chatbot_DB.sql` script in your SQL Server instance to create the necessary tables (`BangKeVatTu`, `DocumentPages`, `TechnicalAttributes`, `IngestionJobs`, `LichSuChat`, etc.).
+2. Set up a cluster on **Qdrant Cloud** and obtain the URL/API Key.
+3. You can initialize Qdrant indexes locally using `python scripts/create_qdrant_indexes.py`.
 
-```bash
-git clone https://github.com/your-username/mechanical-rag-chatbot.git
-cd mechanical-rag-chatbot
-pip install -r requirements.txt
-```
+### 3. Environment Configuration
 
-### 3. Database Setup
-
-1. Execute the `Mech_Chatbot_DB.sql` script in your SQL Server instance to create the necessary tables (`BangKeVatTu`, `RefImages`, chat histories, etc.).
-2. Set up a cluster on **Qdrant Cloud**.
-
-### 4. Environment Configuration
-
-Create a `.env` file in the root directory (based on the provided `.env.example` if applicable) and configure your credentials:
+Create a `.env` file in the root directory and configure your credentials:
 
 ```env
+# SQL Server
 SQL_SERVER=localhost\SQLEXPRESS
 SQL_DATABASE=Mech_Chatbot_DB
 SQL_DRIVER=ODBC Driver 17 for SQL Server
 
-QDRANT_URL=...
-QDRANT_API_KEY=...
+# Qdrant
+QDRANT_URL=https://your-cluster-url.qdrant.tech
+QDRANT_API_KEY=your_qdrant_api_key
 
-COHERE_API_KEY=...
-COHERE_MODEL_NAME=command-r-08-2024
+# LLM & Vision
+PROXYLLM_API_KEY=your_api_key
+PROXYLLM_BASE_URL=https://api.proxyllm.eu/v1
+GPT_MODEL_NAME=gpt-5.4
+GPT_VISION_MODEL_NAME=gpt-5.4-vision
 
-GOOGLE_API_KEY=...
-GEMINI_VISION_MODEL=gemini-2.5-flash
-
+# Embeddings
 EMBEDDING_MODEL=BAAI/bge-m3
 EMBEDDING_DIM=1024
+
+# Service Configurations
+RAG_SERVER_URL=http://localhost:8100
+MAX_CONCURRENT_RAG=2
 ```
 
-### 5. Running the Application
+### 4. Running the Application
 
-Launch the Streamlit application:
+**Option A: Using Docker Compose (Recommended)**
 
+```bash
+docker-compose up -d --build
+```
+This will launch:
+- The Streamlit UI on `http://localhost:8501`
+- The FastAPI RAG Server on `http://localhost:8100`
+- The Ingestion Worker in the background.
+
+**Option B: Running Locally (Development)**
+
+1. Install dependencies:
+```bash
+pip install -r requirements-core.txt
+```
+2. Start the FastAPI RAG server:
+```bash
+python rag_server.py
+```
+3. Start the Background Ingestion worker:
+```bash
+python scripts/ingestion_worker.py
+```
+4. Start the Streamlit UI (in a separate terminal):
 ```bash
 streamlit run app.py
 ```
 
-From the main menu, you can navigate to:
-- **Admin Portal (`app_admin.py`):** Upload new PDFs, process them, and index them into Qdrant/SQL.
-- **Chatbot Portal (`app_chatbot.py`):** Interact with the RAG system and ask mechanical engineering questions.
+### 5. Application Modules
+
+Once running, navigate the Streamlit sidebar to access:
+- **Chatbot Hỏi Đáp:** Interact with the RAG system and ask mechanical engineering questions.
+- **Tiến Trình Ingest:** Monitor background document processing queues and jobs.
+- **Duyệt Tài Liệu:** Upload new technical PDFs and commit them to the ingestion queue (Admin/Uploader roles only).
 
 ## Contributing
 

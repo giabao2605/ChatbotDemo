@@ -1,6 +1,7 @@
 ﻿import streamlit as st
 from sqlalchemy import text
 from mech_chatbot.auth import service as auth
+from mech_chatbot.ingestion.doc_type_registry import canonical_label
 from mech_chatbot.db.repository import (
     engine, update_document_full_metadata, delete_document_completely,
     list_known_departments, list_known_sites,
@@ -138,6 +139,7 @@ def render_document_item(doc, current_user):
             st.write(f"**Ngày tải:** {ngay_tai_len}")
             st.write(f"**Mã đối tượng:** {ma_doi_tuong}")
             st.write(f"**Tên sản phẩm:** {ten_san_pham}")
+            st.write(f"**Loại tài liệu:** {canonical_label(loai_tai_lieu)}")
 
         if auth.has_role("admin"):
             render_admin_actions(doc_id, base_code, version_no, version_label, variant_code, variant_group, loai_tai_lieu, current_user)

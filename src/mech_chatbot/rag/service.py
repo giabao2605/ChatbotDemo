@@ -843,10 +843,20 @@ KNOWN_MATERIALS = [
     "S45C", "SKD11", "SKD61"
 ]
 
+def _known_materials():
+    try:
+        from mech_chatbot.ingestion.material_registry import get_known_materials
+        mats = get_known_materials()
+        if mats:
+            return mats
+    except Exception:
+        pass
+    return KNOWN_MATERIALS
+
 def extract_known_materials(text):
     text_upper = str(text or "").upper().replace(" ", "")
     found = set()
-    for mat in KNOWN_MATERIALS:
+    for mat in _known_materials():
         if mat.upper().replace(" ", "") in text_upper:
             found.add(mat.upper())
     return found

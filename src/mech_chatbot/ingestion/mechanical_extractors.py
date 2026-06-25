@@ -1,5 +1,7 @@
 import re
 
+# P2: danh sach fallback tinh - chi dung khi registry/DB loi.
+# Nguon chinh la material_registry (doc tu DB, quan tri qua UI).
 MATERIAL_PATTERNS = [
     r"\bSUS\s*304\b",
     r"\bSUS\s*316\b",
@@ -9,9 +11,22 @@ MATERIAL_PATTERNS = [
     r"\bA5052\b",
 ]
 
+
+def _material_patterns():
+    """Lay regex vat lieu tu tu dien dong (DB); fallback ve list tinh neu loi."""
+    try:
+        from mech_chatbot.ingestion.material_registry import get_material_patterns
+        pats = get_material_patterns()
+        if pats:
+            return pats
+    except Exception:
+        pass
+    return MATERIAL_PATTERNS
+
+
 def extract_materials(text):
     found = []
-    for pattern in MATERIAL_PATTERNS:
+    for pattern in _material_patterns():
         for m in re.finditer(pattern, text, re.IGNORECASE):
             found.append({
                 "type": "material",

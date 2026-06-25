@@ -29,12 +29,15 @@ def can_access_page(allowed_roles):
 PAGES = [
     {"key": "dashboard", "label": "Tổng quan", "roles": ["admin"]},
     {"key": "chatbot", "label": "Chatbot hỏi đáp", "roles": ["viewer", "uploader", "reviewer", "admin"]},
+    {"key": "help", "label": "Hướng dẫn", "roles": ["viewer", "uploader", "reviewer", "admin"]},
     {"key": "upload", "label": "Tải tài liệu", "roles": ["uploader", "admin"]},
     {"key": "queue", "label": "Tiến trình ingest", "roles": ["uploader", "admin"]},
     {"key": "review", "label": "Duyệt tài liệu", "roles": ["reviewer", "admin"]},
     {"key": "documents", "label": "Kho tài liệu", "roles": ["reviewer", "admin"]},
     {"key": "feedback", "label": "Feedback Loop", "roles": ["reviewer", "admin"]},
     {"key": "users", "label": "Người dùng", "roles": ["admin"]},
+    {"key": "materials", "label": "Từ điển vật tư", "roles": ["admin"]},
+    {"key": "analytics", "label": "Báo cáo sử dụng", "roles": ["admin"]},
     {"key": "audit", "label": "Audit Log", "roles": ["admin"]},
     {"key": "settings", "label": "Cấu hình", "roles": ["admin"]},
 ]
@@ -77,6 +80,9 @@ if page == "dashboard":
 elif page == "chatbot":
     from mech_chatbot.ui.pages import chatbot as app_chatbot
     app_chatbot.run_chat()
+elif page == "help":
+    from mech_chatbot.ui.pages import help as app_help
+    app_help.run_help()
 elif page == "upload":
     from mech_chatbot.ui.pages import upload as app_upload
     app_upload.run_upload()
@@ -95,6 +101,12 @@ elif page == "feedback":
 elif page == "users":
     from mech_chatbot.ui.pages import users as app_users
     app_users.run_users()
+elif page == "materials":
+    from mech_chatbot.ui.pages import materials as app_materials
+    app_materials.run_materials()
+elif page == "analytics":
+    from mech_chatbot.ui.pages import analytics as app_analytics
+    app_analytics.run_analytics()
 elif page == "audit":
     from mech_chatbot.ui.pages import audit as app_audit
     app_audit.run_audit()

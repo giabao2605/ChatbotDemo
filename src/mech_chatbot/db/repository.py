@@ -442,13 +442,25 @@ def get_document_info(doc_id):
         logger.error(f"Loi get_document_info {doc_id}: {e}", exc_info=True)
         return {}
 
+def _normalize_doc_type_label(raw):
+    """P2: chuan hoa nhan loai tai lieu ve dang hien thi chuan (tieng Viet co dau)."""
+    try:
+        from mech_chatbot.ingestion.doc_type_registry import canonical_label
+        label = canonical_label(raw, "vi")
+        if label:
+            return _sanitize_text(label, 255)
+    except Exception:
+        pass
+    return _sanitize_text(raw, 255) or "Khong ro"
+
+
 def _prepare_metadata_params(info):
     ma = info.get("ma_doi_tuong", [])
     if not isinstance(ma, list):
         ma = [str(ma)] if ma and str(ma).strip() != "Khong ro" else []
     return {
         "trang_so": _sanitize_int(info.get("trang_so"), 1),  # default=1: so trang ban ve, hop le
-        "loai_tai_lieu": _sanitize_text(info.get("loai_tai_lieu"), 255) or "Khong ro",
+        "loai_tai_lieu": _normalize_doc_type_label(info.get("loai_tai_lieu")),
         "ma_doi_tuong": json.dumps(ma, ensure_ascii=False),
         "ten_sp": _sanitize_text(info.get("ten_tai_lieu"), 500),
         "cong_doan": _sanitize_text(info.get("cong_doan"), 255),
@@ -655,16 +667,19 @@ def save_document_metadata(file_name, thu_muc, info):
 import re
 
 def normalize_material_name(raw):
+    """P2: uy quyen cho material_registry (tu dien DB). Fallback logic cu neu loi."""
     if not raw:
         return None
-
-    s = str(raw).strip().lower()
-    s = s.replace("inox", "stainless steel")
-    s = s.replace("sus304", "sus 304")
-    s = s.replace("ss304", "sus 304")
-    s = re.sub(r"\s+", " ", s)
-
-    return s
+    try:
+        from mech_chatbot.ingestion.material_registry import normalize_material
+        return normalize_material(raw)
+    except Exception:
+        s = str(raw).strip().lower()
+        s = s.replace("inox", "stainless steel")
+        s = s.replace("sus304", "sus 304")
+        s = s.replace("ss304", "sus 304")
+        s = re.sub(r"\s+", " ", s)
+        return s
 
 def save_bom_records(doc_id, trang_so, records):
     """Luu danh sach cac vat tu cua bang ke vao SQL"""
@@ -1118,6 +1133,7 @@ def update_document_full_metadata(doc_id, base_code=None, version_no=None, versi
         """), {"bc": norm_base, "vn": version_no, "vl": version_label,
                "vc": variant_code, "vg": variant_group, "id": doc_id})
         if loai_tai_lieu is not None:
+            loai_tai_lieu = _normalize_doc_type_label(loai_tai_lieu)
             conn.execute(text("UPDATE TaiLieuKyThuat SET LoaiTaiLieu = :l WHERE DocID = :id"),
                          {"l": loai_tai_lieu, "id": doc_id})
         if norm_base:
@@ -1745,3 +1761,230 @@ def dashboard_by_department():
     except Exception as e:
         logger.error(f"dashboard_by_department loi: {e}", exc_info=True)
         return []
+
+
+# ============================ P2: MATERIAL DICTIONARY ============================
+# CRUD cho tu dien ma vat tu / dong nghia (quan tri qua UI trang 'materials').
+# Sau moi thay doi -> refresh cache cua material_registry de co hieu luc ngay.
+
+def _refresh_material_cache():
+    try:
+        from mech_chatbot.ingestion.material_registry import refresh_cache
+        refresh_cache()
+    except Exception:
+        pass
+
+
+def list_materials():
+    """Tra ve list vat lieu kem dong nghia: [{material_id, code, display, category, is_active, synonyms:[...]}]."""
+    _ensure_engine()
+    with engine.connect() as conn:
+        mats = conn.execute(text(
+            "SELECT MaterialID, CanonicalCode, DisplayName, Category, IsActive "
+            "FROM dbo.MaterialDictionary ORDER BY CanonicalCode"
+        )).fetchall()
+        syns = conn.execute(text(
+            "SELECT SynonymID, MaterialID, Synonym, IsActive FROM dbo.MaterialSynonym ORDER BY Synonym"
+        )).fetchall()
+    syn_by_mat = {}
+    for sid, mid, syn, act in syns:
+        syn_by_mat.setdefault(mid, []).append(
+            {"synonym_id": sid, "synonym": syn, "is_active": bool(act)}
+        )
+    return [
+        {
+            "material_id": m[0], "code": m[1], "display": m[2], "category": m[3],
+            "is_active": bool(m[4]), "synonyms": syn_by_mat.get(m[0], []),
+        }
+        for m in mats
+    ]
+
+
+def upsert_material(code, display=None, category=None, is_active=True, material_id=None):
+    """Them moi hoac cap nhat 1 vat lieu chuan. Match theo material_id (sua) hoac CanonicalCode (them)."""
+    _ensure_engine()
+    code = (code or "").strip()
+    if not code:
+        return False
+    display = (display or code).strip()
+    act = 1 if is_active else 0
+    try:
+        with engine.begin() as conn:
+            if material_id:
+                conn.execute(text(
+                    "UPDATE dbo.MaterialDictionary SET CanonicalCode=:c, DisplayName=:d, "
+                    "Category=:cat, IsActive=:a, UpdatedAt=GETDATE() WHERE MaterialID=:id"
+                ), {"c": code, "d": display, "cat": category, "a": act, "id": material_id})
+            else:
+                exists = conn.execute(text(
+                    "SELECT MaterialID FROM dbo.MaterialDictionary WHERE CanonicalCode=:c"
+                ), {"c": code}).fetchone()
+                if exists:
+                    conn.execute(text(
+                        "UPDATE dbo.MaterialDictionary SET DisplayName=:d, Category=:cat, "
+                        "IsActive=:a, UpdatedAt=GETDATE() WHERE MaterialID=:id"
+                    ), {"d": display, "cat": category, "a": act, "id": exists[0]})
+                else:
+                    conn.execute(text(
+                        "INSERT INTO dbo.MaterialDictionary (CanonicalCode, DisplayName, Category, IsActive) "
+                        "VALUES (:c, :d, :cat, :a)"
+                    ), {"c": code, "d": display, "cat": category, "a": act})
+        _refresh_material_cache()
+        return True
+    except Exception as e:
+        logger.error(f"upsert_material loi cho '{code}': {e}", exc_info=True)
+        return False
+
+
+def delete_material(material_id):
+    """Xoa 1 vat lieu (dong nghia tu xoa theo CASCADE)."""
+    _ensure_engine()
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM dbo.MaterialDictionary WHERE MaterialID=:id"), {"id": material_id})
+        _refresh_material_cache()
+        return True
+    except Exception as e:
+        logger.error(f"delete_material loi cho id {material_id}: {e}", exc_info=True)
+        return False
+
+
+def add_material_synonym(material_id, synonym):
+    """Them 1 tu dong nghia cho vat lieu (bo qua neu trung)."""
+    _ensure_engine()
+    synonym = (synonym or "").strip()
+    if not material_id or not synonym:
+        return False
+    try:
+        with engine.begin() as conn:
+            exists = conn.execute(text(
+                "SELECT SynonymID FROM dbo.MaterialSynonym WHERE MaterialID=:m AND Synonym=:s"
+            ), {"m": material_id, "s": synonym}).fetchone()
+            if not exists:
+                conn.execute(text(
+                    "INSERT INTO dbo.MaterialSynonym (MaterialID, Synonym, IsActive) VALUES (:m, :s, 1)"
+                ), {"m": material_id, "s": synonym})
+        _refresh_material_cache()
+        return True
+    except Exception as e:
+        logger.error(f"add_material_synonym loi: {e}", exc_info=True)
+        return False
+
+
+def delete_material_synonym(synonym_id):
+    """Xoa 1 tu dong nghia."""
+    _ensure_engine()
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM dbo.MaterialSynonym WHERE SynonymID=:id"), {"id": synonym_id})
+        _refresh_material_cache()
+        return True
+    except Exception as e:
+        logger.error(f"delete_material_synonym loi cho id {synonym_id}: {e}", exc_info=True)
+        return False
+
+
+# ============================ P2-6: USAGE ANALYTICS ============================
+# Bao cao su dung tu LichSuChat: cau hoi pho bien, ti le 'khong tim thay',
+# danh gia like/dislike, xu huong theo ngay, tai lieu duoc tham chieu nhieu.
+
+# Cum tu cho thay bot KHONG tra loi duoc (de tinh ti le 'khong tim thay').
+_NO_ANSWER_MARKERS = [
+    "khong tim thay", "khong co thong tin", "khong co du lieu", "khong tim duoc",
+    "khong du can cu", "khong du du kien", "khong xac dinh", "chua co thong tin",
+    "vui long kiem tra lai ma", "ngoai pham vi",
+]
+
+
+def _strip_accents_sql(s):
+    import unicodedata
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFD", str(s))
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return s.replace("\u0111", "d").replace("\u0110", "D").lower().strip()
+
+
+def get_usage_analytics(days=30, top_n=10):
+    """Tong hop thong ke su dung trong 'days' ngay gan nhat.
+    Tra ve dict: totals, no_answer, ratings, top_questions, daily, top_documents.
+    """
+    _ensure_engine()
+    import json as _json
+    out = {
+        "days": days,
+        "total_questions": 0, "total_sessions": 0, "total_users": 0,
+        "no_answer_count": 0, "no_answer_rate": 0.0,
+        "likes": 0, "dislikes": 0,
+        "top_questions": [], "daily": [], "top_documents": [],
+    }
+    try:
+        with engine.connect() as conn:
+            # Totals
+            row = conn.execute(text(
+                "SELECT COUNT(*) AS q, COUNT(DISTINCT SessionID) AS s, "
+                "COUNT(DISTINCT Username) AS u, "
+                "SUM(CASE WHEN DanhGia = 1 THEN 1 ELSE 0 END) AS likes, "
+                "SUM(CASE WHEN DanhGia = -1 THEN 1 ELSE 0 END) AS dislikes "
+                "FROM LichSuChat "
+                "WHERE ThoiGian >= DATEADD(day, -:d, GETDATE())"
+            ), {"d": days}).fetchone()
+            if row:
+                out["total_questions"] = int(row[0] or 0)
+                out["total_sessions"] = int(row[1] or 0)
+                out["total_users"] = int(row[2] or 0)
+                out["likes"] = int(row[3] or 0)
+                out["dislikes"] = int(row[4] or 0)
+
+            # Daily trend
+            daily = conn.execute(text(
+                "SELECT CAST(ThoiGian AS DATE) AS d, COUNT(*) AS c "
+                "FROM LichSuChat WHERE ThoiGian >= DATEADD(day, -:d, GETDATE()) "
+                "GROUP BY CAST(ThoiGian AS DATE) ORDER BY d"
+            ), {"d": days}).fetchall()
+            out["daily"] = [{"date": str(r[0]), "count": int(r[1])} for r in daily]
+
+            # Lay cau hoi + tra loi de tinh no-answer & top questions (python-side de bo dau)
+            rows = conn.execute(text(
+                "SELECT CauHoi_User, TraLoi_Bot, RefImages FROM LichSuChat "
+                "WHERE ThoiGian >= DATEADD(day, -:d, GETDATE())"
+            ), {"d": days}).fetchall()
+
+        from collections import Counter
+        q_counter = Counter()
+        doc_counter = Counter()
+        no_answer = 0
+        for cau_hoi, tra_loi, ref_images in rows:
+            # Top questions (chuan hoa: bo dau, ha thuong, gom khoang trang)
+            qn = _strip_accents_sql(cau_hoi)
+            if qn:
+                q_counter[qn[:200]] += 1
+            # No-answer detection
+            an = _strip_accents_sql(tra_loi)
+            if any(m in an for m in _NO_ANSWER_MARKERS):
+                no_answer += 1
+            # Tai lieu duoc tham chieu nhieu (tu RefImages JSON)
+            if ref_images:
+                try:
+                    refs = _json.loads(ref_images)
+                    for rf in (refs or []):
+                        name = str(rf)
+                        base = name.replace("\\", "/").split("/")[-1]
+                        if base:
+                            doc_counter[base] += 1
+                except Exception:
+                    pass
+
+        out["no_answer_count"] = no_answer
+        if out["total_questions"] > 0:
+            out["no_answer_rate"] = round(100.0 * no_answer / out["total_questions"], 1)
+        out["top_questions"] = [
+            {"question": q, "count": c} for q, c in q_counter.most_common(top_n)
+        ]
+        out["top_documents"] = [
+            {"document": d, "count": c} for d, c in doc_counter.most_common(top_n)
+        ]
+        return out
+    except Exception as e:
+        logger.error(f"get_usage_analytics loi: {e}", exc_info=True)
+        return out

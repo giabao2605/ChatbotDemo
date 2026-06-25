@@ -20,6 +20,44 @@ def extract_first_pages(file_path, num_pages=2):
         logger.error(f"Loi doc file PDF classification {file_path}: {e}")
     return text_content
 
+def extract_pages_for_classification(file_path, max_pages=6, char_budget=6000):
+    """P2-4: Lay noi dung DAI DIEN de phan loai theo NOI DUNG (khong chi ten file).
+    - Tai lieu ngan (<= max_pages trang): doc het.
+    - Tai lieu dai: 2 trang dau + vai trang giua (cach deu) + trang cuoi,
+      gioi han so trang & so ky tu de tiet kiem chi phi/toc do.
+    """
+    text_content = ""
+    try:
+        doc = fitz.open(file_path)
+        total = len(doc)
+        if total == 0:
+            doc.close()
+            return ""
+        if total <= max_pages:
+            indices = list(range(total))
+        else:
+            first = [0, 1]
+            last = [total - 1]
+            remaining = max_pages - len(first) - len(last)
+            mids = []
+            if remaining > 0:
+                step = max(1, (total - 3) // (remaining + 1))
+                pg = 2 + step
+                while pg < total - 1 and len(mids) < remaining:
+                    mids.append(pg)
+                    pg += step
+            indices = sorted(set(first + mids + last))
+        for i in indices:
+            if len(text_content) >= char_budget:
+                break
+            text_content += f"--- Page {i+1} ---\n"
+            text_content += doc[i].get_text() + "\n"
+        doc.close()
+    except Exception as e:
+        logger.error(f"Loi doc file PDF classification {file_path}: {e}")
+    return text_content[:char_budget]
+
+
 def check_existing_family(base_code):
     try:
         with engine.connect() as conn:
@@ -66,7 +104,7 @@ def classify_document(file_path, original_filename=None, thu_muc=None):
     domain = resolve_domain_by_department(thu_muc) if thu_muc else 'chung'
     is_mechanical = domain in ('co_khi', 'ky_thuat')
 
-    text_content = extract_first_pages(file_path, 2)
+    text_content = extract_pages_for_classification(file_path)
     
     # 1. Deterministic Regex Pre-processing
     norm_data = normalize_filename_to_classification(original_filename)
@@ -79,8 +117,8 @@ def classify_document(file_path, original_filename=None, thu_muc=None):
         prompt = f"""
     Thuc hien AI Classification cho tai lieu co khi.
     Ten file: {original_filename}
-    Noi dung 2 trang dau:
-    {text_content[:3000]}
+    Noi dung trich xuat (nhieu trang dai dien):
+    {text_content[:6000]}
     
     Hệ thống đã trích xuất sơ bộ từ tên file bằng Regex:
     - Base Code đề xuất: {regex_base_code}
@@ -97,6 +135,7 @@ def classify_document(file_path, original_filename=None, thu_muc=None):
     - "confidence": Do tu tin (tu 0.0 den 1.0).
     - "reason": Giai thich ngan gon ly do phan loai.
     
+    Uu tien phan loai dua tren NOI DUNG tai lieu o tren; ten file chi la goi y phu.
     Chi tra ve dung JSON. Khong giai thich gi them.
     """
         fallback_doc_type = "technical_drawing"
@@ -106,8 +145,8 @@ def classify_document(file_path, original_filename=None, thu_muc=None):
     Phan loai tai lieu hanh chinh/van phong.
     Domain: {domain}
     Ten file: {original_filename}
-    Noi dung 2 trang dau:
-    {text_content[:3000]}
+    Noi dung trich xuat (nhieu trang dai dien):
+    {text_content[:6000]}
     
     Tra ve MOT JSON object duy nhat voi cac key sau:
     - "base_code": Ma hoac ten rut gon cua tai lieu. Bat buoc.
@@ -119,6 +158,7 @@ def classify_document(file_path, original_filename=None, thu_muc=None):
     - "confidence": Do tu tin (0.0 - 1.0).
     - "reason": Giai thich ngan gon.
     
+    Uu tien phan loai dua tren NOI DUNG tai lieu o tren; ten file chi la goi y phu.
     Chi tra ve dung JSON. Khong giai thich gi them.
     """
         fallback_doc_type = "generic"

@@ -725,6 +725,7 @@ def process_and_ingest_pdf(pdf_path, ten_file, thu_muc, vision_model=None, progr
         "pages_gemini_success": [],
         "failed_pages": [],
         "vision_failed_pages": [],
+        "pages_vision_cache_hit": [],
         "metadata_llm_failed_pages": [],
         "bom_rows_count": 0,
         "technical_attributes_count": 0,
@@ -816,8 +817,20 @@ def process_and_ingest_pdf(pdf_path, ten_file, thu_muc, vision_model=None, progr
                             "Luon tra ve dung dinh dang JSON (khong kem text mo dau/ket thuc ngoai block ```json). "
                             "Dien vao cac mang cac thong tin ky thuat tuong ung ban nhin thay trong hinh."
                         )
-                        response = call_gemini_vision(vision_model, prompt, img_to_analyze)
-                        vision_data = parse_vision_json(response.text)
+                        # P2-5: cache ket qua Vision theo hash anh trang (tiet kiem chi phi)
+                        from mech_chatbot.ingestion import vision_cache as _vc
+                        _page_key = _vc.hash_image_file(img_path)
+                        _cached = _vc.get(_page_key)
+                        if _cached is not None:
+                            vision_data = _cached
+                            report.setdefault("pages_vision_cache_hit", []).append(page_num + 1)
+                            if progress_callback:
+                                progress_callback(f"Trang {page_num+1}: dung lai ket qua Vision tu cache (tiet kiem chi phi).")
+                        else:
+                            response = call_gemini_vision(vision_model, prompt, img_to_analyze)
+                            vision_data = parse_vision_json(response.text)
+                            if vision_data:
+                                _vc.put(_page_key, vision_data)
                         
                         if vision_data:
                             image_summary = format_vision_data(vision_data)

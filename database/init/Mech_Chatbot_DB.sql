@@ -329,7 +329,7 @@ BEGIN
         TraLoi_Bot    NVARCHAR(MAX) NOT NULL,
         HinhAnhUpload NVARCHAR(500),             -- Duong dan anh user upload (neu co)
         RefImages     NVARCHAR(MAX),             -- Danh sach duong dan ban ve can cu dang JSON
-        DanhGia       TINYINT,                  -- 1: Like, -1: Dislike, NULL: Chua danh gia
+        DanhGia       SMALLINT,                 -- 1: Like, -1: Dislike, NULL: Chua danh gia
         ThoiGian      DATETIME DEFAULT GETDATE(),
         Username      NVARCHAR(255) NOT NULL     -- Bat buoc: phan tach lich su chat theo user
     );

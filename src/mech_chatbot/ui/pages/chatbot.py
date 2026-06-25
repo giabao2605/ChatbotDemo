@@ -435,10 +435,10 @@ def run_chat():
             # Nut Danh gia (Feedback)
             if msg.get("chat_id"):
                 fb_key = f"fb_{msg['chat_id']}"
-                feedback = st.feedback("thumbs", key=fb_key)
+                feedback = st.radio("Đánh giá:", ["Thích", "Không thích"], index=None, horizontal=True, key=fb_key, label_visibility="collapsed")
                 processed_key = f"processed_{fb_key}"
                 if feedback is not None and st.session_state.get(processed_key) != feedback:
-                    danh_gia = 1 if feedback == 0 else -1  # st.feedback("thumbs"): 0=like, 1=dislike
+                    danh_gia = 1 if feedback == "Thích" else -1
                     update_chat_feedback(msg["chat_id"], danh_gia)
                     st.session_state[processed_key] = feedback
  
@@ -692,6 +692,19 @@ def run_chat():
                 "ref_images": ref_images,
                 "chat_id": chat_id
             })
-            # Không rerun sau khi trả lời xong, tránh Streamlit bị crash
+
+            # Render nut danh gia NGAY cho cau tra loi vua sinh. History-loop o dau ham
+            # chi ve nut o lan rerun KE TIEP; vi o day KHONG rerun (tranh crash) nen neu
+            # khong ve o day thi cau tra loi vua xong se thieu nut like/dislike.
+            if chat_id:
+                fb_key = f"fb_{chat_id}"
+                feedback = st.radio("Đánh giá:", ["Thích", "Không thích"], index=None, horizontal=True, key=fb_key, label_visibility="collapsed")
+                processed_key = f"processed_{fb_key}"
+                if feedback is not None and st.session_state.get(processed_key) != feedback:
+                    danh_gia = 1 if feedback == "Thích" else -1
+                    update_chat_feedback(chat_id, danh_gia)
+                    st.session_state[processed_key] = feedback
+
+            # Khong rerun sau khi tra loi xong, tranh Streamlit bi crash
             return
             

@@ -204,7 +204,12 @@ def login_screen():
     error_message = st.session_state.pop("login_error", "")
     result = _LIQUID_LOGIN_COMPONENT(error=error_message, default=None, key="liquid_login")
 
-    if result and result.get("submittedAt"):
+    # Chi xu ly MOI lan submit DUY NHAT 1 lan. Custom component giu lai gia tri
+    # cu (ke ca submittedAt) qua moi rerun -> neu khong chot lai se bi lap vo han
+    # (sai mat khau -> set login_error -> st.rerun() -> xu ly lai -> spam restart).
+    submitted_at = result.get("submittedAt") if result else None
+    if submitted_at and st.session_state.get("_last_login_submit") != submitted_at:
+        st.session_state["_last_login_submit"] = submitted_at
         username = (result.get("username") or "").strip()
         password = result.get("password") or ""
         user_data = authenticate_user(username, password)

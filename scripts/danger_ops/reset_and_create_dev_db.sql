@@ -282,7 +282,7 @@ CREATE TABLE LichSuChat (
     TraLoi_Bot    NVARCHAR(MAX) NOT NULL,
     HinhAnhUpload NVARCHAR(500),
     RefImages     NVARCHAR(MAX),
-    DanhGia       TINYINT,
+    DanhGia       SMALLINT,
     ThoiGian      DATETIME DEFAULT GETDATE(),
     Username      NVARCHAR(255) NOT NULL     -- Bat buoc: phan tach lich su chat theo user
 );

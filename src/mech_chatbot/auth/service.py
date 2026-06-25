@@ -66,9 +66,20 @@ def authenticate_user(username, password):
                 allowed_departments = [r[0] for r in dept_rows]
             except Exception:
                 allowed_departments = []
-                
-            if user[3] and user[3] not in allowed_departments:
-                allowed_departments.append(user[3])
+
+            # LUU Y: KHONG tu dong them user[3] (department display label nhu "Ky_Thuat")
+            # vao allowed_departments. Department chi la nhan hien thi; quyen xem tai lieu
+            # duoc kiem soat duy nhat boi bang UserDepartments (chua ten to san xuat thuc te:
+            # To_Han, To_Dap, CHUNG...). Them "Ky_Thuat" vao day se khien filter Qdrant
+            # tim gia tri khong ton tai trong metadata.phong_ban_quyen.
+            if not allowed_departments:
+                # Fallback an toan: neu UserDepartments chua co du lieu, chi cho xem CHUNG
+                allowed_departments = ["CHUNG"]
+                from mech_chatbot.config.logging import logger
+                logger.warning(
+                    f"User '{user[1]}' khong co ban ghi trong UserDepartments. "
+                    "Fallback cho phep xem CHUNG. Chay migration fix_rbac_seed.sql de cap nhat."
+                )
             
             return {
                 "user_id": user[0],

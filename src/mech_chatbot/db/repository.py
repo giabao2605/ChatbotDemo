@@ -69,7 +69,12 @@ def _sanitize_text(val, max_len=None):
         s = s[:max_len]  # Fix: cat chuoi de tranh loi "String or binary data would be truncated"
     return s
  
-def _sanitize_int(val, default=1):
+def _sanitize_int(val, default=None):
+    """Parse so nguyen tu chuoi.
+
+    Tra ve None (khong phai 1) khi khong parse duoc, de caller tu quyet dinh
+    co ghi NULL hay reject. default=1 truoc day co the am tham ghi so luong sai.
+    """
     try:
         nums = re.findall(r"\d+", str(val))
         return int(nums[0]) if nums else default
@@ -116,90 +121,52 @@ def _cap_len(val, max_len):
 # ==========================================
 # CHAT HISTORY
 # ==========================================
-def _chat_history_has_username_column():
-    """Return True when dbo.LichSuChat has Username column.
-
-    This keeps the app backward-compatible before the SQL migration is run.
-    """
-    _ensure_engine()
-    try:
-        with engine.connect() as conn:
-            val = conn.execute(
-                text("SELECT COL_LENGTH('dbo.LichSuChat', 'Username')")
-            ).scalar()
-            return val is not None
-    except Exception as e:
-        logger.warning(f"Khong kiem tra duoc cot Username trong LichSuChat: {e}")
-        return False
-
 
 def save_chat_history(session_id, user_msg, bot_msg, image_path=None, ref_images=None, username=None):
     _ensure_engine()
     try:
-        # FIX C5: serialize danh sach duong dan ban ve can cu thanh JSON string de luu DB
         ref_images_json = json.dumps(ref_images or [], ensure_ascii=False)
-        # FIX C6: gioi han do dai input truoc khi luu (chong payload qua lon lam sap DB)
-        session_id = _cap_len(session_id, 100)
-        user_msg = _cap_len(user_msg, MAX_USER_MSG_LEN)
-        bot_msg = _cap_len(bot_msg, MAX_BOT_MSG_LEN)
-        image_path = _cap_len(image_path, 500)
-        username = _cap_len(username, 255)
-        has_username_col = _chat_history_has_username_column()
+        session_id  = _cap_len(session_id, 100)
+        user_msg    = _cap_len(user_msg, MAX_USER_MSG_LEN)
+        bot_msg     = _cap_len(bot_msg, MAX_BOT_MSG_LEN)
+        image_path  = _cap_len(image_path, 500)
+        username    = _cap_len(username, 255)
 
         with engine.begin() as conn:
-            if has_username_col:
-                query = text(
-                    """
-                    INSERT INTO LichSuChat (SessionID, CauHoi_User, TraLoi_Bot, HinhAnhUpload, RefImages, Username)
+            result = conn.execute(
+                text("""
+                    INSERT INTO LichSuChat
+                        (SessionID, CauHoi_User, TraLoi_Bot, HinhAnhUpload, RefImages, Username)
                     OUTPUT INSERTED.ChatID
                     VALUES (:session_id, :user_msg, :bot_msg, :image_path, :ref_images, :username)
-                    """
-                )
-                params = {
+                """),
+                {
                     "session_id": session_id,
-                    "user_msg": user_msg,
-                    "bot_msg": bot_msg,
+                    "user_msg":   user_msg,
+                    "bot_msg":    bot_msg,
                     "image_path": image_path,
                     "ref_images": ref_images_json,
-                    "username": username,
-                }
-            else:
-                query = text(
-                    """
-                    INSERT INTO LichSuChat (SessionID, CauHoi_User, TraLoi_Bot, HinhAnhUpload, RefImages)
-                    OUTPUT INSERTED.ChatID
-                    VALUES (:session_id, :user_msg, :bot_msg, :image_path, :ref_images)
-                    """
-                )
-                params = {
-                    "session_id": session_id,
-                    "user_msg": user_msg,
-                    "bot_msg": bot_msg,
-                    "image_path": image_path,
-                    "ref_images": ref_images_json,
-                }
-
-            result = conn.execute(query, params)
+                    "username":   username,
+                },
+            )
             row = result.fetchone()
             return row[0] if row else None
     except Exception as e:
         logger.error(f"Loi khi luu lich su chat: {e}", exc_info=True)
         return None
- 
+
 
 def get_all_sessions(username=None, is_admin=False):
     """Lay danh sach session chat.
 
-    - Neu da chay migration them cot Username: user thuong chi thay session cua minh.
+    - User thuong chi thay session cua minh (loc theo Username).
     - Admin thay toan bo.
-    - Neu chua co cot Username: fallback ve hanh vi cu de app khong bi loi.
     """
     _ensure_engine()
     try:
-        has_username_col = _chat_history_has_username_column()
         params = {}
         where_clause = ""
-        if has_username_col and not is_admin:
+        if not is_admin:
             where_clause = "WHERE Username = :username"
             params["username"] = username
 
@@ -235,13 +202,12 @@ def get_all_sessions(username=None, is_admin=False):
  
 
 def get_chat_history(session_id, username=None, is_admin=False):
-    """Lay noi dung mot session chat, co loc user neu da co cot Username."""
+    """Lay noi dung mot session chat, chi tra ve cua user hien tai (tru admin)."""
     _ensure_engine()
     try:
-        has_username_col = _chat_history_has_username_column()
         params = {"session_id": session_id}
         user_filter = ""
-        if has_username_col and not is_admin:
+        if not is_admin:
             user_filter = "AND Username = :username"
             params["username"] = username
 
@@ -280,13 +246,12 @@ def get_chat_history(session_id, username=None, is_admin=False):
  
 
 def clear_chat_history(session_id, username=None, is_admin=False):
-    """Xoa session chat, user thuong chi xoa duoc session cua minh neu co cot Username."""
+    """Xoa session chat — user thuong chi xoa duoc session cua minh."""
     _ensure_engine()
     try:
-        has_username_col = _chat_history_has_username_column()
         params = {"session_id": session_id}
         user_filter = ""
-        if has_username_col and not is_admin:
+        if not is_admin:
             user_filter = "AND Username = :username"
             params["username"] = username
 
@@ -481,7 +446,7 @@ def _prepare_metadata_params(info):
     if not isinstance(ma, list):
         ma = [str(ma)] if ma and str(ma).strip() != "Khong ro" else []
     return {
-        "trang_so": _sanitize_int(info.get("trang_so"), 1),
+        "trang_so": _sanitize_int(info.get("trang_so"), 1),  # default=1: so trang ban ve, hop le
         "loai_tai_lieu": _sanitize_text(info.get("loai_tai_lieu"), 255) or "Khong ro",
         "ma_doi_tuong": json.dumps(ma, ensure_ascii=False),
         "ten_sp": _sanitize_text(info.get("ten_tai_lieu"), 500),
@@ -754,9 +719,10 @@ def search_bom_by_code(
                 
             # RBAC
             if not user_roles or "admin" not in user_roles:
+                # RBAC: KHONG tu dong them user_department vao allowed.
+                # user_department chi la nhan hien thi ("Ky_Thuat"), khong phai ten to.
+                # Quyen xem duoc kiem soat hoan toan boi allowed_departments tu UserDepartments.
                 allowed = list(allowed_departments or [])
-                if user_department and user_department not in allowed:
-                    allowed.append(user_department)
                 if "CHUNG" not in allowed:
                     allowed.append("CHUNG")
 
@@ -1025,33 +991,60 @@ def _get_qdrant_client():
     return _qdrant_client_singleton
 
 def update_qdrant_metadata(doc_id, metadata_updates):
+    """Cap nhat payload metadata cho tat ca Qdrant points cua doc_id.
+
+    Dung cursor pagination thay vi limit=10000 co dinh de xu ly tai lieu
+    co so luong chunk tuy y (> 10k trang).
+    """
     from qdrant_client import models
     client = _get_qdrant_client()
+    BATCH = 500   # so points lay moi lan scroll
     try:
-        scroll_res = client.scroll(
-            collection_name="TaiLieuKyThuat_v2",
-            scroll_filter=models.Filter(
-                must=[models.FieldCondition(key="metadata.doc_id", match=models.MatchValue(value=doc_id))]
-            ),
-            limit=10000,
-            with_payload=True
-        )
-        points, _ = scroll_res
-        if not points:
-            logger.warning(f"Không có Qdrant points cho DocID {doc_id} (tài liệu chưa nạp vào Qdrant). Bỏ qua cập nhật metadata Qdrant, coi như thành công.")
-            return True
-            
-        for p in points:
-            meta = p.payload.get("metadata", {}) if p.payload else {}
-            meta.update(metadata_updates)
-            
-            client.set_payload(
+        total_updated = 0
+        next_offset = None
+        found_any = False
+
+        while True:
+            scroll_res = client.scroll(
                 collection_name="TaiLieuKyThuat_v2",
-                payload={"metadata": meta},
-                points=[p.id]
+                scroll_filter=models.Filter(
+                    must=[models.FieldCondition(key="metadata.doc_id", match=models.MatchValue(value=doc_id))]
+                ),
+                limit=BATCH,
+                offset=next_offset,
+                with_payload=True,
             )
-            
-        logger.info(f"Updated Qdrant payload cho {len(points)} chunks cua DocID {doc_id}")
+            points, next_offset = scroll_res
+
+            if not points:
+                break  # het du lieu hoac khong co points nao
+
+            found_any = True
+            ids_to_update = []
+            for p in points:
+                meta = p.payload.get("metadata", {}) if p.payload else {}
+                meta.update(metadata_updates)
+                # Batch set_payload theo tung point (Qdrant chua ho tro batch update payload)
+                client.set_payload(
+                    collection_name="TaiLieuKyThuat_v2",
+                    payload={"metadata": meta},
+                    points=[p.id],
+                )
+                ids_to_update.append(p.id)
+
+            total_updated += len(ids_to_update)
+
+            if next_offset is None:
+                break  # het trang
+
+        if not found_any:
+            logger.warning(
+                f"update_qdrant_metadata: khong co Qdrant points cho DocID {doc_id}. "
+                "Tai lieu co the chua embed hoac da bi xoa truoc do."
+            )
+            return True  # giu True de khong lam gay publish/reject flow
+
+        logger.info(f"Updated Qdrant payload cho {total_updated} chunks cua DocID {doc_id}")
         return True
     except Exception as e:
         logger.error(f"Loi update Qdrant payload cho DocID {doc_id}: {e}", exc_info=True)
@@ -1098,19 +1091,50 @@ def update_document_full_metadata(doc_id, base_code=None, version_no=None, versi
 
 
 def delete_document_completely(doc_id, reviewer="System"):
-    """Xoa VINH VIEN toan bo du lieu cua 1 tai lieu:
-    - Qdrant vectors (theo metadata.doc_id)
-    - SQL: TaiLieu (keo theo TaiLieuKyThuat + BangKeVatTu nho ON DELETE CASCADE)
-    - IngestionJobs (theo TenFile + ThuMuc)
-    Tra ve True neu thanh cong."""
+    """Xoa VINH VIEN toan bo du lieu cua 1 tai lieu (safe 3-buoc).
+
+    Quy trinh an toan de tranh tai lieu 'ma':
+      1. SQL soft-delete: danh dau LifecycleStatus='deleting', IsCurrent=0
+         (tai lieu bi an khoi RAG nhung SQL van con — co the rollback)
+      2. Xoa vector Qdrant
+         - Neu Qdrant loi -> rollback buoc 1 (khoi phuc LifecycleStatus + IsCurrent)
+      3. SQL hard-delete (xoa han row)
+         - Neu loi o buoc nay: vector da mat, SQL con trang thai 'deleting'
+           -> khong xuat hien trong RAG, co the retry delete_document_completely() an toan.
+    """
     _ensure_engine()
+
+    # Doc thong tin + trang thai hien tai (can de rollback)
     with engine.connect() as conn:
-        row = conn.execute(text("SELECT TenFile, ThuMuc FROM TaiLieu WHERE DocID = :id"), {"id": doc_id}).fetchone()
+        row = conn.execute(
+            text("SELECT TenFile, ThuMuc, LifecycleStatus FROM TaiLieu WHERE DocID = :id"),
+            {"id": doc_id}
+        ).fetchone()
+
     if not row:
         logger.warning(f"delete_document_completely: khong tim thay DocID {doc_id}")
         return False
-    ten_file, thu_muc = row[0], row[1]
 
+    ten_file, thu_muc, prev_status = row[0], row[1], row[2]
+
+    # ------------------------------------------------------------------
+    # Buoc 1: SQL soft-delete — danh dau 'deleting'
+    # ------------------------------------------------------------------
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE TaiLieu SET LifecycleStatus = 'deleting', IsCurrent = 0 WHERE DocID = :id"),
+                {"id": doc_id}
+            )
+        logger.info(f"[delete] 1/3 OK — soft-delete DocID {doc_id} (prev: {prev_status})")
+    except Exception as e:
+        logger.error(f"[delete] 1/3 THAT BAI (soft-delete) DocID {doc_id}: {e}", exc_info=True)
+        return False
+
+    # ------------------------------------------------------------------
+    # Buoc 2: Xoa vector Qdrant
+    # Neu loi -> rollback buoc 1
+    # ------------------------------------------------------------------
     try:
         from qdrant_client import models
         client = _get_qdrant_client()
@@ -1122,23 +1146,51 @@ def delete_document_completely(doc_id, reviewer="System"):
                 )
             )
         )
-        logger.info(f"Da xoa Qdrant points cho DocID {doc_id}")
+        logger.info(f"[delete] 2/3 OK — da xoa Qdrant points cua DocID {doc_id}")
     except Exception as e:
-        logger.error(f"Loi xoa Qdrant points cho DocID {doc_id}: {e}", exc_info=True)
+        logger.error(
+            f"[delete] 2/3 THAT BAI (Qdrant) DocID {doc_id}: {e}. Dang rollback soft-delete.",
+            exc_info=True
+        )
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("UPDATE TaiLieu SET LifecycleStatus = :s, IsCurrent = 1 WHERE DocID = :id"),
+                    {"s": prev_status or "published", "id": doc_id}
+                )
+            logger.info(f"[delete] Rollback OK — DocID {doc_id} khoi phuc ve '{prev_status}'")
+        except Exception as rb_err:
+            logger.error(
+                f"[delete] ROLLBACK THAT BAI DocID {doc_id}: {rb_err}. "
+                "Tai lieu bi ket o trang thai 'deleting' — can xu ly thu cong!",
+                exc_info=True
+            )
         return False
 
+    # ------------------------------------------------------------------
+    # Buoc 3: SQL hard-delete
+    # Neu loi: vector da mat, SQL con trang thai 'deleting' (an khoi RAG)
+    # -> co the retry bang cach goi lai ham nay
+    # ------------------------------------------------------------------
     try:
         with engine.begin() as conn:
-            # 2 bang nay KHONG co FK CASCADE toi TaiLieu -> phai xoa thu cong
-            conn.execute(text("DELETE FROM DocumentPages WHERE DocID = :id"), {"id": doc_id})
+            conn.execute(text("DELETE FROM DocumentPages       WHERE DocID = :id"), {"id": doc_id})
             conn.execute(text("DELETE FROM TechnicalAttributes WHERE DocID = :id"), {"id": doc_id})
-            # TaiLieuKyThuat + BangKeVatTu tu dong xoa theo nho ON DELETE CASCADE
-            conn.execute(text("DELETE FROM TaiLieu WHERE DocID = :id"), {"id": doc_id})
+            # TaiLieuKyThuat + BangKeVatTu tu dong xoa theo ON DELETE CASCADE
+            conn.execute(text("DELETE FROM TaiLieu             WHERE DocID = :id"), {"id": doc_id})
             if ten_file and thu_muc:
-                conn.execute(text("DELETE FROM dbo.IngestionJobs WHERE TenFile = :f AND ThuMuc = :t"),
-                             {"f": ten_file, "t": thu_muc})
+                conn.execute(
+                    text("DELETE FROM dbo.IngestionJobs WHERE TenFile = :f AND ThuMuc = :t"),
+                    {"f": ten_file, "t": thu_muc}
+                )
+        logger.info(f"[delete] 3/3 OK — hard-delete SQL DocID {doc_id} ({ten_file})")
     except Exception as e:
-        logger.error(f"Loi xoa SQL cho DocID {doc_id}: {e}", exc_info=True)
+        logger.error(
+            f"[delete] 3/3 THAT BAI (SQL hard-delete) DocID {doc_id}: {e}. "
+            "Vector Qdrant DA XOA. Ban ghi SQL con trang thai 'deleting'. "
+            f"Retry: delete_document_completely({doc_id})",
+            exc_info=True
+        )
         return False
 
     write_audit_log(reviewer, "delete_document", "TaiLieu", doc_id, {"ten_file": ten_file, "thu_muc": thu_muc})

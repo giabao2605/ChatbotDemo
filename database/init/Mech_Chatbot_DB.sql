@@ -121,7 +121,7 @@ BEGIN
         CONSTRAINT FK_TaiLieu_Family
             FOREIGN KEY (FamilyID) REFERENCES DocumentFamily(FamilyID),
         CONSTRAINT CHK_LifecycleStatus
-            CHECK (LifecycleStatus IN ('draft', 'published', 'archived', 'superseded', 'retired', 'rejected')),
+            CHECK (LifecycleStatus IN ('draft', 'published', 'archived', 'superseded', 'retired', 'rejected', 'deleting')),
         CONSTRAINT CHK_ReviewStatus
             CHECK (ReviewStatus IN ('pending_review', 'approved', 'rejected'))
     );
@@ -203,29 +203,46 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_BangKeVatTu_VatLieu' A
     CREATE INDEX IX_BangKeVatTu_VatLieu ON BangKeVatTu(VatLieu);
 GO
 
--- Full-Text Index cho search_bom_by_code (thay LIKE %...% = khong dung index B-tree)
+-- Full-Text Index cho search_bom_by_code (thay the LIKE %...%)
 -- Yeu cau: SQL Server Full-Text Search service phai duoc cai dat.
 -- Kiem tra: SELECT FULLTEXTSERVICEPROPERTY('IsFullTextInstalled') -- phai tra ve 1
-IF NOT EXISTS (SELECT 1 FROM sys.fulltext_catalogs WHERE name = 'FT_MechChatbot')
+IF FULLTEXTSERVICEPROPERTY('IsFullTextInstalled') = 1
 BEGIN
-    CREATE FULLTEXT CATALOG FT_MechChatbot AS DEFAULT;
+    IF NOT EXISTS (SELECT 1 FROM sys.fulltext_catalogs WHERE name = 'FT_MechChatbot')
+    BEGIN
+        CREATE FULLTEXT CATALOG FT_MechChatbot AS DEFAULT;
+    END
 END
 GO
 
-IF NOT EXISTS (
+IF FULLTEXTSERVICEPROPERTY('IsFullTextInstalled') = 1
+AND NOT EXISTS (
     SELECT 1 FROM sys.fulltext_indexes fi
     JOIN sys.objects o ON fi.object_id = o.object_id
     WHERE o.name = 'BangKeVatTu'
 )
 BEGIN
-    -- Yeu cau BangKeVatTu co unique index (ID la PK, da du dieu kien)
-    CREATE FULLTEXT INDEX ON BangKeVatTu(
-        MaHang   LANGUAGE 1033,  -- English tokenizer (phu hop cho ma hang kieu alphanumeric)
-        TenVatTu LANGUAGE 1066   -- Vietnamese (neu cai dat; fallback ve Neutral neu khong co)
-    )
-    KEY INDEX PK__BangKeVa__3214EC07  -- Ten PK index; doi ten neu khac trong moi truong
-    ON FT_MechChatbot
-    WITH CHANGE_TRACKING AUTO;
+    -- Lay ten PK dong tu sys.key_constraints thay vi hard-code ten tu sinh
+    -- (SQL Server tu sinh hau to ngau nhien nhu PK__BangKeVa__3214EC07 nen khac nhau moi DB)
+    DECLARE @pk_name NVARCHAR(256);
+    SELECT @pk_name = kc.name
+    FROM sys.key_constraints kc
+    JOIN sys.objects o ON kc.parent_object_id = o.object_id
+    WHERE o.name = 'BangKeVatTu' AND kc.type = 'PK';
+
+    IF @pk_name IS NOT NULL
+    BEGIN
+        DECLARE @sql NVARCHAR(MAX);
+        SET @sql = N'
+            CREATE FULLTEXT INDEX ON BangKeVatTu(
+                MaHang   LANGUAGE 1033,
+                TenVatTu LANGUAGE 1066
+            )
+            KEY INDEX ' + QUOTENAME(@pk_name) + N'
+            ON FT_MechChatbot
+            WITH CHANGE_TRACKING AUTO;';
+        EXEC sp_executesql @sql;
+    END
 END
 GO
 

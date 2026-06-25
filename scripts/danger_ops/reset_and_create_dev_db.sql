@@ -160,7 +160,7 @@ CREATE TABLE TaiLieu (
     CONSTRAINT FK_TaiLieu_Family
         FOREIGN KEY (FamilyID) REFERENCES DocumentFamily(FamilyID),
     CONSTRAINT CHK_LifecycleStatus
-        CHECK (LifecycleStatus IN ('draft', 'published', 'archived', 'superseded', 'retired', 'rejected')),
+        CHECK (LifecycleStatus IN ('draft', 'published', 'archived', 'superseded', 'retired', 'rejected', 'deleting')),
     CONSTRAINT CHK_ReviewStatus
         CHECK (ReviewStatus IN ('pending_review', 'approved', 'rejected'))
 );

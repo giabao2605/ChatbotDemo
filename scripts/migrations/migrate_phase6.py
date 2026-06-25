@@ -63,7 +63,7 @@ def migrate_phase6():
         BEGIN
             ALTER TABLE dbo.TaiLieu
             ADD CONSTRAINT CHK_LifecycleStatus
-            CHECK (LifecycleStatus IN ('draft', 'published', 'archived', 'superseded', 'retired', 'rejected'));
+            CHECK (LifecycleStatus IN ('draft', 'published', 'archived', 'superseded', 'retired', 'rejected', 'deleting'));
         END
         """,
         """

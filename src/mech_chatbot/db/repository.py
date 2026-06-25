@@ -678,7 +678,11 @@ def search_bom_by_code(
     user_roles=None,
     allowed_departments=None,
 ):
-    """Tim kiem bang ke vat tu tren SQL theo ma hang hoac ma doi tuong (parent assembly)"""
+    """Tim kiem bang ke vat tu tren SQL theo ma hang hoac ma doi tuong (parent assembly).
+
+    Su dung CONTAINS() neu Full-Text Index da duoc cai dat tren BangKeVatTu,
+    fallback ve LIKE '%...%' neu Full-Text Search khong kha dung.
+    """
     if not ma_hang_list:
         return []
     if not user_roles:
@@ -687,21 +691,46 @@ def search_bom_by_code(
     _ensure_engine()
     try:
         with engine.connect() as conn:
-            # Tao dieu kien OR cho tung ma bang EXISTS de tranh bo sot khi khac trang
+            # Kiem tra Full-Text Index co kha dung khong (1 lan, nhe)
+            ft_row = conn.execute(text(
+                """SELECT COUNT(1) FROM sys.fulltext_indexes fi
+                   JOIN sys.objects o ON fi.object_id = o.object_id
+                   WHERE o.name = 'BangKeVatTu'"""
+            )).scalar()
+            use_fulltext = (ft_row or 0) > 0
+
+            # Tao dieu kien OR cho tung ma
             conditions = []
-            for i in range(len(ma_hang_list)):
-                conditions.append(f"""
-                (
-                    b.MaHang LIKE :m{i} 
-                    OR EXISTS (
-                        SELECT 1 
-                        FROM TaiLieuKyThuat tk 
-                        WHERE tk.DocID = b.DocID 
-                        AND tk.MaDoiTuong LIKE :m{i}
+            params = {}
+            for i, m in enumerate(ma_hang_list):
+                if use_fulltext:
+                    # CONTAINS dung double-quote de tim cum tu chinh xac hon
+                    # prefix search: "ma*" khop maHang bat dau bang ma
+                    params[f"m{i}"] = f'"{m}*"'
+                    conditions.append(f"""
+                    (
+                        CONTAINS(b.MaHang, :m{i})
+                        OR EXISTS (
+                            SELECT 1 FROM TaiLieuKyThuat tk
+                            WHERE tk.DocID = b.DocID
+                            AND tk.MaDoiTuong LIKE :ml{i}
+                        )
                     )
-                )
-                """)
-            
+                    """)
+                    params[f"ml{i}"] = f"%{m}%"   # MaDoiTuong la NVARCHAR(MAX), FT ko ho tro
+                else:
+                    params[f"m{i}"] = f"%{m}%"
+                    conditions.append(f"""
+                    (
+                        b.MaHang LIKE :m{i}
+                        OR EXISTS (
+                            SELECT 1 FROM TaiLieuKyThuat tk
+                            WHERE tk.DocID = b.DocID
+                            AND tk.MaDoiTuong LIKE :m{i}
+                        )
+                    )
+                    """)
+
             filter_sql = "1=1"
             if version_policy in ["current_only", "all_current_variants"]:
                 filter_sql += " AND t.LifecycleStatus = 'published' AND t.ReviewStatus = 'approved' AND t.IsCurrent = 1"
@@ -716,12 +745,9 @@ def search_bom_by_code(
                     filter_sql += f" AND t.VersionNo IN ({vers_str})"
             else:
                 filter_sql += " AND t.LifecycleStatus = 'published' AND t.ReviewStatus = 'approved' AND t.IsCurrent = 1"
-                
-            # RBAC
+
+            # RBAC: chi dung allowed_departments tu UserDepartments, khong tu dong them department
             if not user_roles or "admin" not in user_roles:
-                # RBAC: KHONG tu dong them user_department vao allowed.
-                # user_department chi la nhan hien thi ("Ky_Thuat"), khong phai ten to.
-                # Quyen xem duoc kiem soat hoan toan boi allowed_departments tu UserDepartments.
                 allowed = list(allowed_departments or [])
                 if "CHUNG" not in allowed:
                     allowed.append("CHUNG")
@@ -730,27 +756,25 @@ def search_bom_by_code(
                 for i, dept in enumerate(allowed):
                     key = f"dept{i}"
                     dept_conditions.append(f"t.ThuMuc = :{key}")
+                    params[key] = dept
 
                 filter_sql += " AND (" + " OR ".join(dept_conditions) + ")"
-            
+
             query = text(f"""
-                SELECT DISTINCT b.MaHang, b.TenVatTu, b.VatLieu, b.SoLuong, b.GhiChu, t.TenFile, t.VersionNo 
+                SELECT DISTINCT b.MaHang, b.TenVatTu, b.VatLieu, b.SoLuong, b.GhiChu, t.TenFile, t.VersionNo
                 FROM BangKeVatTu b
                 JOIN TaiLieu t ON b.DocID = t.DocID
                 WHERE {filter_sql} AND (
                     {" OR ".join(conditions)}
                 )
             """)
-            params = {f"m{i}": f"%{m}%" for i, m in enumerate(ma_hang_list)}
-            if not user_roles or "admin" not in user_roles:
-                for i, dept in enumerate(allowed):
-                    params[f"dept{i}"] = dept
-                
+
             result = conn.execute(query, params).fetchall()
             return result
     except Exception as e:
         logger.error(f"Loi search_bom_by_code: {e}", exc_info=True)
         return []
+
 
 # ==========================================
 # BACKGROUND JOBS

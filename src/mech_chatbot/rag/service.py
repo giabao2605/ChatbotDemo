@@ -947,6 +947,7 @@ def make_debug_info(docs=None):
                 "is_current": d.metadata.get("is_current"),
                 "lifecycle_status": d.metadata.get("lifecycle_status"),
                 "review_status": d.metadata.get("review_status"),
+                "trang": d.metadata.get("trang_so"),
                 "score": d.metadata.get("relevance_score"),
             }
             for d in docs

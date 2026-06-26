@@ -31,21 +31,23 @@ def run_feedback():
 def load_feedbacks(only_pending):
     query = """
         SELECT FeedbackID, ChatID, Question, BotAnswer, FailureType,
-               CorrectAnswer, AddedToGoldenSet, CreatedAt
+               CorrectAnswer, AddedToGoldenSet, CreatedAt,
+               DocVersionNo, Department, IsStale
         FROM FeedbackReview
         WHERE 1 = 1
     """
     if only_pending:
-        query += " AND ISNULL(AddedToGoldenSet, 0) = 0"
+        query += " AND ISNULL(AddedToGoldenSet, 0) = 0 AND ISNULL(IsStale, 0) = 0"
     query += " ORDER BY CreatedAt DESC"
     with engine.connect() as conn:
         return conn.execute(text(query)).fetchall()
 
 
 def render_feedback_item(fb):
-    fid, cid, question, bot_answer, failure_type, correct_answer, added, created = fb
+    fid, cid, question, bot_answer, failure_type, correct_answer, added, created, doc_ver, dept, is_stale = fb
     title_q = (question or "")[:80]
-    with st.expander(f"[{created}] ChatID {cid} · {title_q}"):
+    stale_badge = " · ⚠️STALE" if is_stale else ""
+    with st.expander(f"[{created}] ChatID {cid} · v{doc_ver or '?'} · {dept or '-'}{stale_badge} · {title_q}"):
         st.write("### Câu hỏi")
         st.write(question or "")
         st.write("### Câu trả lời bot")

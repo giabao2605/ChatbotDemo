@@ -17,6 +17,7 @@ from mech_chatbot.db.repository import (
     save_chat_history,
     clear_chat_history,
     update_chat_feedback,
+    save_answer_sources,
     get_all_sessions,
     get_chat_history,
     create_ingestion_job, write_audit_log,
@@ -676,6 +677,13 @@ def run_chat():
                 ref_images=ref_images,  # FIX C5: luu danh sach duong dan ban ve can cu
                 username=current_user["username"]
             )
+
+            # P3-1: luu nguon (tai lieu/version/trang) da dung de sinh cau tra loi
+            try:
+                if chat_id and isinstance(debug_info, dict):
+                    save_answer_sources(chat_id, debug_info.get("retrieved_docs", []))
+            except Exception:
+                pass
             
             # Log audit
             write_audit_log(

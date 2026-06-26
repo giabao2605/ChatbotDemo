@@ -2,6 +2,7 @@ import os
 import re
 import json
 import urllib.parse  # Fix: phai import urllib.parse tuong minh (import urllib khong du)
+import hashlib
 from datetime import datetime
  
 from sqlalchemy import create_engine, text
@@ -156,6 +157,53 @@ def save_chat_history(session_id, user_msg, bot_msg, image_path=None, ref_images
         return None
 
 
+def save_answer_sources(chat_id, retrieved_docs):
+    """P3-1: Luu cac tai lieu/chunk RAG da dung de sinh cau tra loi (truy vet nguon)."""
+    if not chat_id or not retrieved_docs:
+        return
+    _ensure_engine()
+
+    def _to_int(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _to_float(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    try:
+        with engine.begin() as conn:
+            for rank_no, d in enumerate(retrieved_docs, start=1):
+                if not isinstance(d, dict):
+                    continue
+                is_cur = d.get("is_current")
+                conn.execute(
+                    text("""
+                        INSERT INTO AnswerSource
+                            (ChatID, DocID, FileName, VersionNo, VariantCode, ChunkRef, Score, RankNo, IsCurrent)
+                        VALUES
+                            (:cid, :doc_id, :fn, :vn, :vc, :chunk, :score, :rank_no, :is_cur)
+                    """),
+                    {
+                        "cid": chat_id,
+                        "doc_id": _to_int(d.get("doc_id")),
+                        "fn": _cap_len(d.get("file_goc"), 500),
+                        "vn": _to_int(d.get("version_no")),
+                        "vc": _cap_len(d.get("variant_code"), 100),
+                        "chunk": _cap_len(None if d.get("trang") is None else str(d.get("trang")), 200),
+                        "score": _to_float(d.get("score")),
+                        "rank_no": rank_no,
+                        "is_cur": (None if is_cur is None else (1 if is_cur else 0)),
+                    },
+                )
+    except Exception as e:
+        logger.error(f"Loi khi luu nguon cau tra loi (AnswerSource): {e}", exc_info=True)
+
+
 def get_all_sessions(username=None, is_admin=False):
     """Lay danh sach session chat.
 
@@ -269,6 +317,37 @@ def clear_chat_history(session_id, username=None, is_admin=False):
     except Exception as e:
         logger.error(f"Loi khi xoa lich su chat: {e}", exc_info=True)
  
+def _question_hash(q):
+    """Chuan hoa cau hoi (bo dau, lowercase, gom khoang trang) roi bam sha256 -> gom cau trung."""
+    try:
+        s = unicodedata.normalize("NFKD", str(q or "")).encode("ascii", "ignore").decode("ascii")
+        s = " ".join(s.lower().split())
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()
+    except Exception:
+        return None
+
+
+def mark_feedback_stale_for_doc(doc_id, resolved_by_doc_id=None):
+    """P3-2: Danh dau feedback cu (SourceDocID = doc_id) la 'stale' khi tai lieu duoc cap nhat
+    metadata hoac bi superseded -> khong tinh vao diem chat luong ban moi."""
+    if doc_id is None:
+        return 0
+    _ensure_engine()
+    try:
+        with engine.begin() as conn:
+            res = conn.execute(text("""
+                UPDATE FeedbackReview
+                SET IsStale = 1, ResolvedByDocID = :rb, ResolvedAt = GETDATE()
+                WHERE ISNULL(IsStale, 0) = 0
+                  AND ISNULL(AddedToGoldenSet, 0) = 0
+                  AND SourceDocID = :d
+            """), {"d": doc_id, "rb": resolved_by_doc_id})
+            return res.rowcount if res.rowcount is not None else 0
+    except Exception as e:
+        logger.error(f"Loi khi danh dau feedback stale (DocID {doc_id}): {e}", exc_info=True)
+        return 0
+
+
 def update_chat_feedback(chat_id, danh_gia):
     _ensure_engine()
     try:
@@ -286,9 +365,26 @@ def update_chat_feedback(chat_id, danh_gia):
                     # Check if already in FeedbackReview
                     exists = conn.execute(text("SELECT 1 FROM FeedbackReview WHERE ChatID = :c"), {"c": chat_id}).fetchone()
                     if not exists:
+                        # P3-2: gan version + ngu canh cua nguon da dung sinh cau tra loi
+                        src = conn.execute(text(
+                            "SELECT TOP 1 DocID, VersionNo FROM AnswerSource "
+                            "WHERE ChatID = :c AND DocID IS NOT NULL ORDER BY RankNo ASC, SourceID ASC"
+                        ), {"c": chat_id}).fetchone()
+                        src_doc_id = src[0] if src else None
+                        src_ver = src[1] if src else None
+                        dept = site = None
+                        if src_doc_id is not None:
+                            ds = conn.execute(text("SELECT ThuMuc, Site FROM TaiLieu WHERE DocID = :d"), {"d": src_doc_id}).fetchone()
+                            if ds:
+                                dept, site = ds[0], ds[1]
                         conn.execute(
-                            text("INSERT INTO FeedbackReview (ChatID, Question, BotAnswer) VALUES (:c, :q, :b)"),
-                            {"c": chat_id, "q": row[0], "b": row[1]}
+                            text(
+                                "INSERT INTO FeedbackReview "
+                                "(ChatID, Question, BotAnswer, SourceDocID, DocVersionNo, ContextHash, Department, Site) "
+                                "VALUES (:c, :q, :b, :sd, :sv, :ch, :dept, :site)"
+                            ),
+                            {"c": chat_id, "q": row[0], "b": row[1], "sd": src_doc_id, "sv": src_ver,
+                             "ch": _question_hash(row[0]), "dept": _cap_len(dept, 100), "site": _cap_len(site, 100)}
                         )
     except Exception as e:
         logger.error(f"Loi khi cap nhat danh gia chat: {e}", exc_info=True)
@@ -1153,6 +1249,8 @@ def update_document_full_metadata(doc_id, base_code=None, version_no=None, versi
     if loai_tai_lieu is not None: qmeta["loai_tai_lieu"] = loai_tai_lieu
 
     ok = update_qdrant_metadata(doc_id, qmeta) if qmeta else True
+    # P3-2: metadata da doi -> feedback cu cua tai lieu nay tro thanh stale
+    mark_feedback_stale_for_doc(doc_id, resolved_by_doc_id=doc_id)
     write_audit_log(reviewer, "update_metadata", "TaiLieu", doc_id,
                     {"base_code": norm_base, "version": version_no, "variant": variant_code})
     return ok
@@ -1327,6 +1425,9 @@ def publish_as_new_version(doc_id, reviewer="System"):
         if not ok_new:
             raise RuntimeError(f"Update Qdrant metadata that bai cho DocID {doc.DocID}")
         
+    # P3-2: tai lieu cu da bi thay the -> feedback dislike cu cua chung tro thanh stale
+    for _old in old_docs:
+        mark_feedback_stale_for_doc(_old.DocID, resolved_by_doc_id=doc.DocID)
     write_audit_log(reviewer, "publish_new_version", "TaiLieu", doc.DocID, {"base_code": doc.BaseCode, "version": doc.VersionNo, "superseded": old_id})
     return True
 

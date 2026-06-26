@@ -356,7 +356,35 @@ BEGIN
         ReviewerNote      NVARCHAR(MAX),
         AddedToGoldenSet  BIT DEFAULT 0,
         CreatedAt         DATETIME DEFAULT GETDATE(),
+        SourceDocID       INT NULL,
+        DocVersionNo      INT NULL,
+        ContextHash       NVARCHAR(64) NULL,
+        Department        NVARCHAR(100) NULL,
+        Site              NVARCHAR(100) NULL,
+        IsStale           BIT NOT NULL DEFAULT 0,
+        ResolvedByDocID   INT NULL,
+        ResolvedAt        DATETIME NULL,
         CONSTRAINT FK_FeedbackReview_ChatID
+            FOREIGN KEY (ChatID) REFERENCES LichSuChat(ChatID) ON DELETE CASCADE
+    );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.objects WHERE object_id = OBJECT_ID(N'dbo.AnswerSource') AND type = 'U')
+BEGIN
+    CREATE TABLE AnswerSource (
+        SourceID    INT IDENTITY(1,1) PRIMARY KEY,
+        ChatID      INT NOT NULL,
+        DocID       INT NULL,
+        FileName    NVARCHAR(500) NULL,
+        VersionNo   INT NULL,
+        VariantCode NVARCHAR(100) NULL,
+        ChunkRef    NVARCHAR(200) NULL,
+        Score       FLOAT NULL,
+        RankNo      INT NULL,
+        IsCurrent   BIT NULL,
+        CreatedAt   DATETIME DEFAULT GETDATE(),
+        CONSTRAINT FK_AnswerSource_ChatID
             FOREIGN KEY (ChatID) REFERENCES LichSuChat(ChatID) ON DELETE CASCADE
     );
 END

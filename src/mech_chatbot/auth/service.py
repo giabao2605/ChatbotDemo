@@ -245,8 +245,10 @@ def has_role(role_name):
     return role_name in user["roles"] or "admin" in user["roles"]
 
 def logout():
-    if "user" in st.session_state:
-        del st.session_state["user"]
+    # GD5 fix (lo ri du lieu): xoa SACH session khi dang xuat. Truoc day chi xoa "user"
+    # nen chat_history/session_id van con trong session_state -> account dang nhap sau
+    # van thay lai cuoc tro chuyen cu (vd admin hoi ve luong -> viewer login bi lo).
+    st.session_state.clear()
     st.rerun()
 
 
@@ -256,11 +258,11 @@ def is_admin():
 
 
 def get_allowed_departments():
+    # GD5 fix nhat quan RBAC: chi tra ve allowed_departments tu UserDepartments (nguon su that).
+    # Truoc day ham tu them user["department"] (nhan hien thi, vd "Ky_Thuat") vao danh sach,
+    # mau thuan voi authenticate_user (co tinh KHONG them) va co the chen ma phong khong ton tai
+    # trong metadata.phong_ban_quyen. Quyen xem tai lieu kiem soat duy nhat boi UserDepartments.
     user = get_current_user()
     if not user:
         return []
-    allowed = list(user.get("allowed_departments") or [])
-    dept = user.get("department")
-    if dept and dept not in allowed:
-        allowed.append(dept)
-    return allowed
+    return list(user.get("allowed_departments") or [])

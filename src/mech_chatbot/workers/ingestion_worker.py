@@ -35,6 +35,7 @@ def run_worker():
             security_override = job.get("security_level")
             cong_doan_override = job.get("cong_doan")
             site_override = job.get("site")
+            phong_ban_override = job.get("phong_ban")
             
             logger.info(f"Worker bắt đầu xử lý JobID {job_id}: {file_name}")
             print(f"\n[{time.strftime('%H:%M:%S')}] Đang xử lý: {file_name}")
@@ -89,6 +90,7 @@ def run_worker():
                 security_override=security_override,
                 cong_doan_override=cong_doan_override,
                 site_override=site_override,
+                phong_ban_override=phong_ban_override,
                 scan_sensitive=True,
             )
             
@@ -110,8 +112,12 @@ def run_worker():
 
                 if report and report.get("quality_status") in ["ready_for_review", "needs_review"]:
                     update_ingestion_job(job_id, status="pending_review", error_message="")
+                elif report and report.get("quality_status") == "blocked":
+                    # GD5: KHONG chan cung tai lieu chat luong thap. Dua vao duyet thu cong de
+                    # reviewer/admin kiem tra va co the override khi publish.
+                    update_ingestion_job(job_id, status="pending_review", error_message="Canh bao chat luong (blocked): can reviewer kiem tra va override truoc khi publish.")
                 else:
-                    mark_job_failed(job_id, error_message=message + " (Failed quality gate: blocked)")
+                    mark_job_failed(job_id, error_message=message + " (Failed quality gate: khong xac dinh duoc noi dung)")
             else:
                 logger.error(f"Job {job_id} thất bại: {message}")
                 print(f"[{time.strftime('%H:%M:%S')}] Thất bại: {message}")

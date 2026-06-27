@@ -8,6 +8,7 @@ from datetime import datetime
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 from mech_chatbot.config.logging import logger
+from mech_chatbot.config.settings import QDRANT_COLLECTION
  
 load_dotenv()
  
@@ -221,10 +222,11 @@ def get_all_sessions(username=None, is_admin=False):
         with engine.connect() as conn:
             query = text(
                 f"""
-                SELECT SessionID, ThoiGianBatDau, CauHoiDauTien FROM (
+                SELECT SessionID, ThoiGianBatDau, CauHoiDauTien, Owner FROM (
                     SELECT SessionID,
                            CauHoi_User AS CauHoiDauTien,
                            ThoiGian AS ThoiGianBatDau,
+                           Username AS Owner,
                            ROW_NUMBER() OVER (PARTITION BY SessionID ORDER BY ThoiGian ASC, ChatID ASC) AS rn
                     FROM LichSuChat
                     {where_clause}
@@ -242,7 +244,7 @@ def get_all_sessions(username=None, is_admin=False):
                     label = cau_hoi[:30] + "..."
                 else:
                     label = cau_hoi or "(Khong co tieu de)"
-                out.append({"session_id": row[0], "thoi_gian": row[1], "cau_hoi": label})
+                out.append({"session_id": row[0], "thoi_gian": row[1], "cau_hoi": label, "owner": row[3]})
             return out
     except Exception as e:
         logger.error(f"Loi khi lay danh sach session: {e}", exc_info=True)
@@ -751,6 +753,45 @@ def _get_or_create_doc(conn, file_name, thu_muc):
     row = res.fetchone()
     return row[0] if row else None
  
+def update_document_classification(doc_id, domain=None, security_level=None, phong_ban=None):
+    """GD5 fix ro ri: dong bo lai Domain/SecurityLevel/PhongBan cho TaiLieu sau khi co
+    override tu form va escalation tu sensitive_scanner. Truoc day _get_or_create_doc ghi
+    TaiLieu theo ClassificationJson (suy tu folder) nen khi override/escalate muc mat,
+    TaiLieu lech voi payload Qdrant -> duong SQL BOM (t.SecurityLevel) co the lo tai lieu mat.
+    """
+    if doc_id is None:
+        return
+    _ensure_engine()
+    try:
+        sets = []
+        params = {"d": doc_id}
+        if domain is not None:
+            sets.append("Domain = :domain")
+            params["domain"] = domain
+        if security_level is not None:
+            sets.append("SecurityLevel = :seclvl")
+            params["seclvl"] = security_level
+        if phong_ban is not None:
+            if isinstance(phong_ban, (list, tuple, set)):
+                items = []
+                for x in phong_ban:
+                    for part in str(x).split(","):
+                        p = part.strip()
+                        if p and p not in items:
+                            items.append(p)
+                pb_csv = ",".join(items)
+            else:
+                pb_csv = str(phong_ban).strip()
+            sets.append("PhongBan = :pb")
+            params["pb"] = pb_csv
+        if not sets:
+            return
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE TaiLieu SET " + ", ".join(sets) + " WHERE DocID = :d"), params)
+    except Exception as e:
+        logger.error(f"Loi update_document_classification doc_id={doc_id}: {e}", exc_info=True)
+
+
 def mark_document_ingest_failed(file_name, thu_muc, error_message=None):
     _ensure_engine()
     try:
@@ -1107,6 +1148,7 @@ def search_bom_by_code(
     user_department=None,
     user_roles=None,
     allowed_departments=None,
+    max_security_level=None,
 ):
     """Tim kiem bang ke vat tu tren SQL theo ma hang hoac ma doi tuong (parent assembly).
 
@@ -1185,10 +1227,37 @@ def search_bom_by_code(
                 dept_conditions = []
                 for i, dept in enumerate(allowed):
                     key = f"dept{i}"
-                    dept_conditions.append(f"t.ThuMuc = :{key}")
+                    lk = f"deptlk{i}"
+                    # GD5 muc 4: ho tro tai lieu chia se nhieu phong (TaiLieu.PhongBan dang CSV).
+                    # Khop theo bien gioi dau phay de tranh sub-string match (vd 'QC' vs 'QC2').
+                    dept_conditions.append(
+                        "(t.ThuMuc = :" + key + " OR (t.PhongBan IS NOT NULL AND ',' + t.PhongBan + ',' LIKE :" + lk + "))"
+                    )
                     params[key] = dept
+                    params[lk] = f"%,{dept},%"
 
                 filter_sql += " AND (" + " OR ".join(dept_conditions) + ")"
+
+                # GD5 muc 1: RBAC chieu thu 2 — muc mat (security_level).
+                # Truoc day duong SQL BOM CHI loc phong ban (ThuMuc) ma KHONG loc SecurityLevel
+                # -> user clearance thap van moi duoc du lieu BOM tu tai lieu 'confidential'
+                # qua nga SQL (trong khi nga Qdrant da chan). Dong bo logic voi _security_filter
+                # / _allowed_levels ben rag/service.py: cho xem cac muc <= clearance, mac dinh 'internal'.
+                _LEVEL_ORDER = {"public": 0, "internal": 1, "confidential": 2}
+                _max_order = _LEVEL_ORDER.get((max_security_level or "internal"), 1)
+                _sec_levels = [lvl for lvl, o in _LEVEL_ORDER.items() if o <= _max_order]
+                sec_conditions = []
+                for i, lvl in enumerate(_sec_levels):
+                    key = f"sec{i}"
+                    sec_conditions.append(f"t.SecurityLevel = :{key}")
+                    params[key] = lvl
+                # GD5 muc 5: tai lieu THIEU muc mat coi nhu confidential. Chi cho NULL/rong khi
+                # user co clearance confidential; nguoc lai an di (dong bo voi _security_filter Qdrant).
+                _allow_empty_sec = "confidential" in _sec_levels
+                if _allow_empty_sec:
+                    filter_sql += " AND (t.SecurityLevel IS NULL OR LTRIM(RTRIM(t.SecurityLevel)) = '' OR " + " OR ".join(sec_conditions) + ")"
+                else:
+                    filter_sql += " AND (t.SecurityLevel IS NOT NULL AND LTRIM(RTRIM(t.SecurityLevel)) <> '' AND (" + " OR ".join(sec_conditions) + "))"
 
             query = text(f"""
                 SELECT DISTINCT b.MaHang, b.TenVatTu, b.VatLieu, b.SoLuong, b.GhiChu, t.TenFile, t.VersionNo
@@ -1235,7 +1304,7 @@ def create_ingestion_job(file_name, file_path, thu_muc, uploaded_by=None,
                 {
                     "f": file_name, "p": file_path, "t": thu_muc, "u": uploaded_by,
                     "dom": domain, "sec": security_level,
-                    "pb": phong_ban or thu_muc, "cd": cong_doan, "site": site,
+                    "pb": (",".join(str(x).strip() for x in phong_ban if str(x).strip()) if isinstance(phong_ban, (list, tuple, set)) else phong_ban) or thu_muc, "cd": cong_doan, "site": site,
                 }
             )
             row = result.fetchone()
@@ -1467,7 +1536,7 @@ def write_audit_log(username, action, entity_type=None, entity_id=None, details=
 _qdrant_client_singleton = None
 
 def _get_qdrant_client():
-    """QdrantClient nhẹ, KHÔNG nạp model RAG (torch/onnxruntime) vào tiến trình hiện tại.
+    """QdrantClient nhẹ, KHÔNG nạp model RAG (torch/onnxruntime) vào tiến tr��nh hiện tại.
     Dùng cho thao tác admin (publish/reject/archive) gọi từ Streamlit để tránh crash native."""
     global _qdrant_client_singleton
     if _qdrant_client_singleton is None:
@@ -1495,7 +1564,7 @@ def update_qdrant_metadata(doc_id, metadata_updates):
 
         while True:
             scroll_res = client.scroll(
-                collection_name="TaiLieuKyThuat_v2",
+                collection_name=QDRANT_COLLECTION,
                 scroll_filter=models.Filter(
                     must=[models.FieldCondition(key="metadata.doc_id", match=models.MatchValue(value=doc_id))]
                 ),
@@ -1515,7 +1584,7 @@ def update_qdrant_metadata(doc_id, metadata_updates):
                 meta.update(metadata_updates)
                 # Batch set_payload theo tung point (Qdrant chua ho tro batch update payload)
                 client.set_payload(
-                    collection_name="TaiLieuKyThuat_v2",
+                    collection_name=QDRANT_COLLECTION,
                     payload={"metadata": meta},
                     points=[p.id],
                 )
@@ -1643,7 +1712,7 @@ def delete_document_completely(doc_id, reviewer="System"):
         from qdrant_client import models
         client = _get_qdrant_client()
         client.delete(
-            collection_name="TaiLieuKyThuat_v2",
+            collection_name=QDRANT_COLLECTION,
             points_selector=models.FilterSelector(
                 filter=models.Filter(
                     must=[models.FieldCondition(key="metadata.doc_id", match=models.MatchValue(value=doc_id))]

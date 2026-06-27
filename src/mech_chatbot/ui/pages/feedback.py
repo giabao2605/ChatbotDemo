@@ -1,4 +1,4 @@
-﻿import streamlit as st
+import streamlit as st
 from sqlalchemy import text
 from mech_chatbot.auth import service as auth
 from mech_chatbot.db.repository import (
@@ -169,3 +169,21 @@ def render_feedback_item(fb):
             else:
                 st.success("Đã cập nhật feedback.")
             st.rerun()
+
+        st.divider()
+        if st.button("🗑️ Xóa feedback", key=f"del_fb_{fid}"):
+            st.session_state[f"confirm_del_fb_{fid}"] = True
+        if st.session_state.get(f"confirm_del_fb_{fid}"):
+            st.warning("Xác nhận xóa vĩnh viễn feedback này? Không thể hoàn tác.")
+            cdc1, cdc2 = st.columns(2)
+            with cdc1:
+                if st.button("✅ Xác nhận xóa", key=f"confirm_del_fb_btn_{fid}", type="primary"):
+                    with engine.begin() as conn:
+                        conn.execute(text("DELETE FROM FeedbackReview WHERE FeedbackID = :fid"), {"fid": fid})
+                    st.session_state.pop(f"confirm_del_fb_{fid}", None)
+                    st.success("Đã xóa feedback.")
+                    st.rerun()
+            with cdc2:
+                if st.button("Hủy", key=f"cancel_del_fb_{fid}"):
+                    st.session_state.pop(f"confirm_del_fb_{fid}", None)
+                    st.rerun()

@@ -10,8 +10,7 @@ from mech_chatbot.db.repository import (
     write_audit_log,
     update_document_full_metadata,
     delete_document_completely,
-    update_qdrant_metadata,
-    upsert_golden_answer
+    update_qdrant_metadata
 )
 
 # GD4b: dung chung cho form duyet (linh hoat da phong ban)
@@ -48,8 +47,7 @@ def run_admin():
     tabs = st.tabs([
         "Chờ Duyệt (Pending)", 
         "Đã Duyệt (Published)", 
-        "Bị Từ Chối (Rejected)",
-        "Feedback Loop"
+        "Bị Từ Chối (Rejected)"
     ])
     
     with engine.connect() as conn:
@@ -58,11 +56,12 @@ def run_admin():
                    tk.MaDoiTuong, tk.LoaiTaiLieu, tk.TenSanPham, tk.VatLieu, tk.DungSaiDay, tk.KichThuocTongThe,
                    j.ClassificationJson, j.RequestedAction, t.LifecycleStatus, j.ClassificationConfidence,
                    t.BaseCode, t.VersionNo, t.VersionLabel, t.VariantCode, t.VariantGroup,
-                   t.Domain, t.SecurityLevel, t.Site
+                   t.Domain, t.SecurityLevel, t.Site,
+                   j.QualityStatus, j.QualityScore
             FROM TaiLieu t
             LEFT JOIN TaiLieuKyThuat tk ON t.DocID = tk.DocID AND tk.TrangSo = 1
             OUTER APPLY (
-                SELECT TOP 1 ClassificationJson, RequestedAction, ClassificationConfidence 
+                SELECT TOP 1 ClassificationJson, RequestedAction, ClassificationConfidence, QualityStatus, QualityScore 
                 FROM dbo.IngestionJobs j2 
                 WHERE j2.TenFile = t.TenFile AND j2.ThuMuc = t.ThuMuc 
                 ORDER BY j2.CreatedAt DESC
@@ -91,7 +90,7 @@ def run_admin():
             return
 
         for d in docs:
-            doc_id, ten_file, thu_muc, review_status, ngay_tai_len, ma_dt, loai_tl, ten_sp, vat_lieu, dung_sai, kich_thuoc, class_json, req_action, life_status, class_conf, t_bc, t_vn, t_vl, t_vc, t_vg, t_dom, t_sec, t_site = d
+            doc_id, ten_file, thu_muc, review_status, ngay_tai_len, ma_dt, loai_tl, ten_sp, vat_lieu, dung_sai, kich_thuoc, class_json, req_action, life_status, class_conf, t_bc, t_vn, t_vl, t_vc, t_vg, t_dom, t_sec, t_site, t_qstatus, t_qscore = d
             
             with st.expander(f"{ten_file} - Tải lên: {ngay_tai_len.strftime('%Y-%m-%d')} | Trạng thái: {life_status}"):
                 st.write(f"**Thư mục:** {thu_muc}")
@@ -114,7 +113,7 @@ def run_admin():
                 _is_mech = (t_dom or "generic") == "mechanical"
                 col1, col2 = st.columns(2)
                 with col1:
-                    st.write(f"- **Phòng ban:** {thu_muc}")
+                    st.write(f"- **Ph��ng ban:** {thu_muc}")
                     st.write(f"- **Lĩnh vực (domain):** {DOMAIN_LABELS.get(t_dom, t_dom or '(chưa gán)')}")
                     st.write(f"- **Mức mật:** {t_sec or '(chưa gán)'}")
                     st.write(f"- **Khu / Site:** {t_site or '(chưa gán)'}")
@@ -153,6 +152,13 @@ def run_admin():
                         edit_security = st.selectbox("Mức mật", SECURITY_LEVELS, index=_sec_idx, key=f"sec_{doc_id}")
                     with cole:
                         edit_site = st.text_input("Khu / Site", value=t_site or "", key=f"site_{doc_id}")
+
+                    # GD5: gate chat luong — cho phep reviewer/admin override khi tai lieu bi blocked
+                    _is_blocked = (t_qstatus == "blocked")
+                    override_quality = False
+                    if _is_blocked:
+                        st.warning(f"⚠️ Tài liệu đang bị chặn bởi gate chất lượng (quality_status=blocked, điểm {t_qscore or 0}/100). Hãy kiểm tra kỹ nội dung trước khi publish.")
+                        override_quality = st.checkbox("Tôi đã kiểm tra và vẫn muốn publish (override gate chất lượng)", key=f"ovr_{doc_id}")
 
                     action_choice = st.radio(
                         "Chọn hành động Publish (AI Đề xuất: " + cls_data.get('detected_action', 'new_document') + "):",
@@ -228,6 +234,13 @@ def run_admin():
                         else:
                             success = False
                             is_publish_action = "Từ chối" not in action_choice
+
+                            # GD5: chan publish neu tai lieu blocked ma chua tick override
+                            if is_publish_action and _is_blocked and not override_quality:
+                                st.error("Tài liệu đang bị chặn bởi gate chất lượng. Hãy tích ô override để publish, hoặc chọn phương án từ chối / lưu nháp.")
+                                st.stop()
+                            if is_publish_action and _is_blocked and override_quality:
+                                write_audit_log(current_user["username"], "override_quality_gate", "TaiLieu", doc_id, {"quality_status": t_qstatus, "quality_score": t_qscore, "action": action_choice})
                             
                             if is_publish_action:
                                 with engine.begin() as conn:
@@ -324,64 +337,3 @@ def run_admin():
         render_doc_list(published_docs, show_actions=False, allow_manage=True)
     with tabs[2]:
         render_doc_list(rejected_docs, show_actions=False, allow_manage=True)
-    with tabs[3]:
-        st.subheader("Phân Loại Lỗi Chatbot (Feedback Loop)")
-        with engine.connect() as conn:
-            feedbacks = conn.execute(text("SELECT FeedbackID, ChatID, Question, BotAnswer, FailureType, AddedToGoldenSet, CreatedAt FROM FeedbackReview ORDER BY CreatedAt DESC")).fetchall()
-            
-        if not feedbacks:
-            st.info("Chưa có feedback (dislike) nào cần xử lý.")
-        else:
-            for fb in feedbacks:
-                fid, cid, q, ans, ftype, added_to_golden, created = fb
-                with st.expander(f"[{created.strftime('%Y-%m-%d %H:%M')}] ChatID: {cid} | Câu hỏi: {q[:50]}..."):
-                    st.write(f"**Câu hỏi:** {q}")
-                    st.write(f"**Câu trả lời của bot:** {ans}")
-                    
-                    if added_to_golden:
-                        st.success(f"Đã phân loại: **{ftype}** và thêm vào Golden Set.")
-                    else:
-                        selected_type = st.selectbox(
-                            "Chọn loại lỗi:",
-                            ["wrong_version", "wrong_source", "retrieval_miss", "ocr_error", "bom_parse_error", "hallucination", "should_refuse", "permission_error", "other"],
-                            key=f"ftype_{fid}"
-                        )
-                        correct_ans = st.text_area("Câu trả lời đúng (Dành cho bot học/nhớ):", key=f"cans_{fid}")
-                        exp_kw = st.text_input("Expected Keywords (cách nhau bởi dấu phẩy):", key=f"kw_{fid}")
-                        exp_src = st.text_input("Expected Sources (cách nhau bởi dấu phẩy):", key=f"src_{fid}")
-                        forb_src = st.text_input("Forbidden Sources (cách nhau bởi dấu phẩy):", key=f"fsrc_{fid}")
-                        
-                        if st.button("Phân loại & Cập nhật", key=f"btn_fb_{fid}"):
-                            with engine.begin() as conn:
-                                conn.execute(
-                                    text("UPDATE FeedbackReview SET FailureType = :ft, CorrectAnswer = :ca, AddedToGoldenSet = 1 WHERE FeedbackID = :fid"),
-                                    {"ft": selected_type, "ca": correct_ans, "fid": fid}
-                                )
-                                
-                                kw_list = [k.strip() for k in exp_kw.split(",") if k.strip()]
-                                src_list = [s.strip() for s in exp_src.split(",") if s.strip()]
-                                fsrc_list = [f.strip() for f in forb_src.split(",") if f.strip()]
-                                
-                                # Add to golden set
-                                golden_entry = {
-                                    "id": f"FB_{fid}",
-                                    "level": "feedback_recovery",
-                                    "question": q,
-                                    "expected_keywords": kw_list,
-                                    "expected_sources": src_list,
-                                    "forbidden_sources": fsrc_list,
-                                    "expected_version_policy": "current_only",
-                                    "should_refuse": selected_type == "should_refuse",
-                                    "failure_type": selected_type
-                                }
-                                import os
-                                golden_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "golden_set.jsonl")
-                                with open(golden_path, "a", encoding="utf-8") as gf:
-                                    gf.write(json.dumps(golden_entry, ensure_ascii=False) + "\n")
-                                    
-                            if correct_ans and correct_ans.strip():
-                                with engine.connect() as _c:
-                                    _sr = _c.execute(text("SELECT SourceDocID, Department, Site FROM FeedbackReview WHERE FeedbackID = :fid"), {"fid": fid}).fetchone()
-                                upsert_golden_answer(question=q, answer=correct_ans, source_doc_id=(_sr[0] if _sr else None), department=(_sr[1] if _sr else None), site=(_sr[2] if _sr else None), created_by="admin", feedback_id=fid)
-                            st.success("Đã cập nhật và thêm vào Golden Set!")
-                            st.rerun()

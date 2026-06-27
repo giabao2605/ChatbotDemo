@@ -40,7 +40,7 @@ def run_documents():
 
     # Danh sách phòng ban khả dụng cho user (admin thấy tất cả)
     if is_admin:
-        dept_options = [d["code"] for d in list_known_departments(active_only=False)]
+        dept_options = [d["code"] for d in list_known_departments(active_only=True)]
     else:
         dept_options = [d for d in (current_user.get("allowed_departments") or [current_user.get("department")]) if d]
     with fc2:

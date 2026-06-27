@@ -329,8 +329,8 @@ def run_chat():
             for s in group_sessions:
                 is_current = (s['session_id'] == st.session_state.session_id)
                 btn_type = "primary" if is_current else "secondary"
-                # Label tren 1 dong
-                label = f"{s['cau_hoi']}"
+                # Label tren 1 dong (admin: kem ten chu phien de de phan biet history cua tung account)
+                label = f"[{s.get('owner') or '?'}] {s['cau_hoi']}" if is_admin else f"{s['cau_hoi']}"
                 col1, col2 = st.columns([85, 15])
                 with col1:
                     if st.button(label, key=f"btn_chat_{s['session_id']}", use_container_width=True, type=btn_type):
@@ -693,6 +693,36 @@ def run_chat():
                 entity_id=chat_id,
                 details={"prompt": prompt, "session_id": st.session_state.session_id}
             )
+
+            # GD5 muc 3: Audit doc tai lieu CONFIDENTIAL. Neu cau tra loi co dung nguon
+            # co security_level == 'confidential', ghi mot ban ghi audit rieng (read_confidential)
+            # de admin truy vet duoc ai da xem tai lieu mat va xem tai lieu nao.
+            try:
+                if isinstance(debug_info, dict):
+                    _conf_sources = [
+                        {
+                            "doc_id": d.get("doc_id"),
+                            "file_goc": d.get("file_goc"),
+                            "version_no": d.get("version_no"),
+                        }
+                        for d in debug_info.get("retrieved_docs", [])
+                        if isinstance(d, dict) and d.get("security_level") == "confidential"
+                    ]
+                    if _conf_sources:
+                        write_audit_log(
+                            username=current_user["username"],
+                            action="read_confidential",
+                            entity_type="LichSuChat",
+                            entity_id=chat_id,
+                            details={
+                                "session_id": st.session_state.session_id,
+                                "prompt": prompt,
+                                "so_tai_lieu_mat": len(_conf_sources),
+                                "nguon_mat": _conf_sources,
+                            },
+                        )
+            except Exception:
+                pass
 
             st.session_state.chat_history.append({
                 "role": "assistant",

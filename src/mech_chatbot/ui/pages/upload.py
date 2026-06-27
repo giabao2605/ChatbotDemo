@@ -85,6 +85,13 @@ def run_upload():
         )
 
         # 2) Domain / muc mat / site suy theo phong, cho chinh khi can.
+        # GD5 muc 4: chia se tai lieu cho nhieu phong ban (multi-value phong_ban_quyen)
+        extra_departments = st.multiselect(
+            "Chia sẻ thêm cho phòng ban khác (tùy chọn)",
+            [d for d in allowed_departments if d != target_department],
+            help="Tài liệu sẽ đọc được bởi phòng chính và các phòng được chọn thêm.",
+        )
+
         def_domain, def_security, def_site = _resolve_defaults(target_department)
 
         st.markdown(
@@ -96,7 +103,6 @@ def run_upload():
         chosen_domain = def_domain
         chosen_security = def_security
         chosen_site = def_site
-        chosen_cong_doan = None
 
         with st.expander("T\u00f9y ch\u1ec9nh ph\u00e2n lo\u1ea1i (n\u00e2ng cao)", expanded=False):
             # Muc mat: mac dinh theo phong. Khong co quyen admin -> khong duoc HA thap.
@@ -122,14 +128,6 @@ def run_upload():
                     index=list(DOMAIN_LABELS.keys()).index(def_domain),
                     format_func=lambda x: DOMAIN_LABELS.get(x, x),
                 )
-
-            # Cong doan (To): chi co y nghia voi tai lieu co khi (vd phong San xuat).
-            if chosen_domain == "mechanical":
-                chosen_cong_doan = st.text_input(
-                    "C\u00f4ng \u0111o\u1ea1n / T\u1ed5 (t\u00f9y ch\u1ecdn)",
-                    value="",
-                    help="V\u00ed d\u1ee5: To_Han, To_Tien_Phay... \u0110\u1ec3 tr\u1ed1ng n\u1ebfu kh\u00f4ng c\u1ea7n.",
-                ).strip() or None
 
             # Site (tuy chon).
             chosen_site = (st.text_input(
@@ -159,12 +157,13 @@ def run_upload():
         save_uploaded_files(
             uploaded_files, target_department, current_user,
             domain=chosen_domain, security_level=chosen_security,
-            cong_doan=chosen_cong_doan, site=chosen_site,
+            site=chosen_site,
+            extra_departments=extra_departments,
         )
 
 
 def save_uploaded_files(uploaded_files, target_department, current_user,
-                        domain=None, security_level=None, cong_doan=None, site=None):
+                        domain=None, security_level=None, cong_doan=None, site=None, extra_departments=None):
     success_count = 0
     fail_count = 0
     base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
@@ -176,7 +175,6 @@ def save_uploaded_files(uploaded_files, target_department, current_user,
         st.write(
             f"Ph\u00f2ng: **{target_department}** | Domain: **{domain}** | "
             f"M\u1ee9c m\u1eadt: **{security_level}**"
-            + (f" | C\u00f4ng \u0111o\u1ea1n: **{cong_doan}**" if cong_doan else "")
             + (f" | Site: **{site}**" if site else "")
         )
         for idx, uploaded_file in enumerate(uploaded_files):
@@ -191,7 +189,8 @@ def save_uploaded_files(uploaded_files, target_department, current_user,
                     safe_original_name, file_path, dept_folder,
                     uploaded_by=current_user["username"],
                     domain=domain, security_level=security_level,
-                    cong_doan=cong_doan, site=site, phong_ban=dept_folder,
+                    cong_doan=cong_doan, site=site,
+                    phong_ban=[dept_folder] + [safe_folder_name(d) for d in (extra_departments or [])],
                 )
                 if job_id:
                     success_count += 1

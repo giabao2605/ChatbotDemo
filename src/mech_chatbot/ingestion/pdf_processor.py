@@ -9,13 +9,14 @@ from PIL import Image
 import pdfplumber
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from mech_chatbot.config.settings import QDRANT_COLLECTION
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception
 from transformers import AutoTokenizer
 import underthesea
 from qdrant_client import models
 from mech_chatbot.config.logging import logger
 # FIX #1: dung 2 ham moi (reset 1 lan + insert tung trang). Giu save_document_metadata cho file 1 trang.
-from mech_chatbot.db.repository import reset_document_metadata, save_page_metadata, save_document_metadata, save_bom_records, get_document_info, mark_document_ingest_failed, save_document_page, save_technical_attributes, save_document_attributes
+from mech_chatbot.db.repository import reset_document_metadata, save_page_metadata, save_document_metadata, save_bom_records, get_document_info, mark_document_ingest_failed, save_document_page, save_technical_attributes, save_document_attributes, update_document_classification
 from mech_chatbot.rag.service import vectorstore, client
 # FIX Bug #4: predicate retry dung chung cho Gemini (google-genai)
 from mech_chatbot.llm.vision_client import describe_gemini_error, is_retryable_error
@@ -361,7 +362,7 @@ def _add_docs_with_retry(chunks):
 
 def _delete_vectors_for_file(ten_file, thu_muc):
     client.delete(
-        collection_name="TaiLieuKyThuat_v2",
+        collection_name=QDRANT_COLLECTION,
         points_selector=models.Filter(must=[
             models.FieldCondition(key="metadata.file_goc", match=models.MatchValue(value=ten_file)),
             models.FieldCondition(key="metadata.phong_ban_quyen", match=models.MatchValue(value=thu_muc)),
@@ -705,7 +706,32 @@ def has_mechanical_signal(text):
     return any(re.search(p, text, re.IGNORECASE) for p in patterns)
 
 # 3. Ham xu ly PDF trung tam
-def process_and_ingest_pdf(pdf_path, ten_file, thu_muc, vision_model=None, progress_callback=None, domain_override=None, security_override=None, cong_doan_override=None, site_override=None, scan_sensitive=False):
+def _normalize_phong_ban_quyen(thu_muc, phong_ban_override=None):
+    # GD5 muc 4: phong_ban_quyen la DANH SACH phong ban duoc quyen doc tai lieu.
+    # Luon co thu_muc (phong chu / folder) dau tien, roi cac phong chia se them.
+    # phong_ban_override: list hoac chuoi ngan cach bang dau phay; deo trung lap.
+    result = []
+
+    def _add(v):
+        if v is None:
+            return
+        if isinstance(v, (list, tuple, set)):
+            for x in v:
+                _add(x)
+            return
+        for part in str(v).split(","):
+            p = part.strip()
+            if p and p not in result:
+                result.append(p)
+
+    _add(thu_muc)
+    _add(phong_ban_override)
+    if not result:
+        result = ["CHUNG"]
+    return result
+
+
+def process_and_ingest_pdf(pdf_path, ten_file, thu_muc, vision_model=None, progress_callback=None, domain_override=None, security_override=None, cong_doan_override=None, site_override=None, scan_sensitive=False, phong_ban_override=None):
     from mech_chatbot.ingestion.domain_registry import resolve_domain_by_department, resolve_security_by_department
     from mech_chatbot.ingestion.site_registry import resolve_site_by_department
     domain = domain_override or resolve_domain_by_department(thu_muc)
@@ -735,6 +761,7 @@ def process_and_ingest_pdf(pdf_path, ten_file, thu_muc, vision_model=None, progr
     }
     doc = None
     pdf_table_reader = None
+    doc_id = None
     try:
         doc = fitz.open(pdf_path)
         report["total_pages"] = len(doc)
@@ -966,7 +993,7 @@ def process_and_ingest_pdf(pdf_path, ten_file, thu_muc, vision_model=None, progr
                         )
                 metadata = {
                     "file_goc": ten_file,
-                    "phong_ban_quyen": thu_muc,
+                    "phong_ban_quyen": _normalize_phong_ban_quyen(thu_muc, phong_ban_override),
                     "ma_doi_tuong": info["ma_doi_tuong"],
                     "ma_chinh": info.get("ma_chinh", []),
                     "ma_btp": info.get("ma_btp", []),
@@ -1134,6 +1161,21 @@ def process_and_ingest_pdf(pdf_path, ten_file, thu_muc, vision_model=None, progr
     if report["status"] == "success" and (report["failed_pages"] or report["total_chunks"] == 0):
         report["status"] = "error"
 
+    # GD5 fix ro ri: dong bo Domain/SecurityLevel/PhongBan cuoi cung (override + escalation) xuong
+    # TaiLieu + chuan hoa lai payload Qdrant de SQL BOM khong lech voi vector store.
+    if report["status"] == "success" and doc_id:
+        _phong_ban_list = _normalize_phong_ban_quyen(thu_muc, phong_ban_override)
+        update_document_classification(doc_id, domain=domain, security_level=security_level, phong_ban=_phong_ban_list)
+        try:
+            client.set_payload(
+                collection_name=QDRANT_COLLECTION,
+                payload={"security_level": security_level, "domain": domain},
+                points=models.Filter(must=[models.FieldCondition(key="metadata.doc_id", match=models.MatchValue(value=doc_id))]),
+                key="metadata",
+            )
+        except Exception as _e:
+            logger.warning(f"Khong dong bo duoc payload Qdrant cho doc_id={doc_id}: {_e}")
+
     if report["status"] == "error" and ROLLBACK_ON_INGEST_ERROR:
         try:
             _delete_vectors_for_file(ten_file, thu_muc)
@@ -1165,7 +1207,7 @@ def process_and_ingest_pdf(pdf_path, ten_file, thu_muc, vision_model=None, progr
     report["message"] = " ".join(message_parts)
     return report
  
-def process_and_ingest_file(file_path, ten_file, thu_muc, vision_model=None, progress_callback=None, domain_override=None, security_override=None, cong_doan_override=None, site_override=None, scan_sensitive=False):
+def process_and_ingest_file(file_path, ten_file, thu_muc, vision_model=None, progress_callback=None, domain_override=None, security_override=None, cong_doan_override=None, site_override=None, scan_sensitive=False, phong_ban_override=None):
     from mech_chatbot.ingestion.domain_registry import resolve_domain_by_department, resolve_security_by_department
     from mech_chatbot.ingestion.site_registry import resolve_site_by_department
     domain = domain_override or resolve_domain_by_department(thu_muc)
@@ -1193,6 +1235,7 @@ def process_and_ingest_file(file_path, ten_file, thu_muc, vision_model=None, pro
         "time_taken": 0,
         "message": ""
     }
+    doc_id = None
     try:
         if progress_callback:
             progress_callback(f"Dang doc noi dung file {ext}...")
@@ -1261,7 +1304,7 @@ def process_and_ingest_file(file_path, ten_file, thu_muc, vision_model=None, pro
 
         metadata = {
             "file_goc": ten_file,
-            "phong_ban_quyen": thu_muc,
+            "phong_ban_quyen": _normalize_phong_ban_quyen(thu_muc, phong_ban_override),
             "ma_doi_tuong": info["ma_doi_tuong"],
             "ma_chinh": info.get("ma_chinh", []),
             "ma_btp": info.get("ma_btp", []),
@@ -1349,6 +1392,21 @@ def process_and_ingest_file(file_path, ten_file, thu_muc, vision_model=None, pro
  
     if report["status"] == "success" and report["total_chunks"] == 0:
         report["status"] = "error"
+
+    # GD5 fix ro ri: dong bo Domain/SecurityLevel/PhongBan cuoi cung (override + escalation) xuong
+    # TaiLieu + chuan hoa lai payload Qdrant de SQL BOM khong lech voi vector store.
+    if report["status"] == "success" and doc_id:
+        _phong_ban_list = _normalize_phong_ban_quyen(thu_muc, phong_ban_override)
+        update_document_classification(doc_id, domain=domain, security_level=security_level, phong_ban=_phong_ban_list)
+        try:
+            client.set_payload(
+                collection_name=QDRANT_COLLECTION,
+                payload={"security_level": security_level, "domain": domain},
+                points=models.Filter(must=[models.FieldCondition(key="metadata.doc_id", match=models.MatchValue(value=doc_id))]),
+                key="metadata",
+            )
+        except Exception as _e:
+            logger.warning(f"Khong dong bo duoc payload Qdrant cho doc_id={doc_id}: {_e}")
 
     if report["status"] == "error" and ROLLBACK_ON_INGEST_ERROR:
         try:

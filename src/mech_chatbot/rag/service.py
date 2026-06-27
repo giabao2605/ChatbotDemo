@@ -7,6 +7,7 @@ import warnings
 import time
 import uuid
 from datetime import datetime
+from mech_chatbot.config.settings import QDRANT_COLLECTION
  
 # Tat toan bo canh bao rac
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
@@ -96,11 +97,11 @@ class RAGSystem:
         logger.info("   -> Dang khoi tao mo hinh BM25 (Qdrant/bm25)...")
         sparse_embeddings = FastEmbedSparse(model_name="Qdrant/bm25")
  
-        if not client.collection_exists("TaiLieuKyThuat_v2"):
-            logger.info("   -> Collection 'TaiLieuKyThuat_v2' khong ton tai. Dang tao moi...")
+        if not client.collection_exists(QDRANT_COLLECTION):
+            logger.info(f"   -> Collection '{QDRANT_COLLECTION}' khong ton tai. Dang tao moi...")
             embedding_dim = int(os.getenv("EMBEDDING_DIM", "1024"))
             client.create_collection(
-                collection_name="TaiLieuKyThuat_v2",
+                collection_name=QDRANT_COLLECTION,
                 vectors_config=models.VectorParams(
                     size=embedding_dim,
                     distance=models.Distance.COSINE
@@ -120,7 +121,7 @@ class RAGSystem:
  
         vectorstore = QdrantVectorStore(
             client=client,
-            collection_name="TaiLieuKyThuat_v2",
+            collection_name=QDRANT_COLLECTION,
             embedding=embeddings,
             sparse_embedding=sparse_embeddings,
             sparse_vector_name="sparse",
@@ -345,11 +346,17 @@ def _allowed_levels(max_security_level):
 
 def _security_filter(max_security_level):
     levels = _allowed_levels(max_security_level)
+    # GD5 muc 5: tai lieu THIEU metadata.security_level coi nhu MAT (confidential).
+    # Truoc day IsEmptyCondition cho MOI nguoi thay tai lieu chua gan muc mat -> ho hong bao mat.
+    # Nay chi user co clearance 'confidential' (levels chua 'confidential') moi duoc thay tai lieu
+    # chua gan muc mat (empty); user clearance thap se KHONG con thay -> mac dinh an toan.
+    allow_empty = "confidential" in levels
+    should = []
+    if allow_empty:
+        should.append(models.IsEmptyCondition(is_empty=models.PayloadField(key="metadata.security_level")))
+    should.append(models.FieldCondition(key="metadata.security_level", match=models.MatchAny(any=levels)))
     try:
-        return models.Filter(should=[
-            models.IsEmptyCondition(is_empty=models.PayloadField(key="metadata.security_level")),
-            models.FieldCondition(key="metadata.security_level", match=models.MatchAny(any=levels)),
-        ])
+        return models.Filter(should=should)
     except Exception:
         return models.FieldCondition(key="metadata.security_level", match=models.MatchAny(any=levels))
 
@@ -742,7 +749,7 @@ def heuristic_missing_evidence_reason(question, context_text):
 
 def make_insufficient_evidence_message(question, reason):
     return (
-        f"Tài liệu hiện tại không ghi thông tin đủ để trả lời câu hỏi này ({reason}).\n\n"
+        f"Tài liệu hiện tại không ghi thông tin ��ủ để tr�� lời câu hỏi này ({reason}).\n\n"
         "Mình sẽ không tự ước lượng hoặc tự bịa số liệu. Để trả lời được, bạn cần bổ sung tài liệu có dữ kiện trực tiếp liên quan, "
         "ví dụ thời gian gia công cho 1 sản phẩm, năng suất theo giờ/ca, định mức sản xuất, chi phí hoặc tiêu chuẩn kiểm tra tương ứng."
     )
@@ -991,6 +998,8 @@ def make_debug_info(docs=None):
                 "review_status": d.metadata.get("review_status"),
                 "trang": d.metadata.get("trang_so"),
                 "score": d.metadata.get("relevance_score"),
+                # GD5 muc 3: kem muc mat de tang audit doc tai lieu confidential o tang UI.
+                "security_level": d.metadata.get("security_level"),
             }
             for d in docs
         ]
@@ -1269,6 +1278,7 @@ def chat_with_rag(user_question, image_path=None, chat_history=None, current_par
                 user_department=user_department,
                 user_roles=user_roles,
                 allowed_departments=allowed_departments,
+                max_security_level=max_security_level,
             )
             if bom_results:
                 bom_text = "Dữ liệu cấu trúc Bảng Kê Vật Tư (BOM) từ SQL Database (Rất chính xác):\n"
@@ -1572,6 +1582,8 @@ def build_source_citations(docs):
         loai = doc.metadata.get('loai_du_lieu', '')
         # Lay thu_muc de reconstruct ten file anh dung format (Fix Bug #7)
         thu_muc = doc.metadata.get('phong_ban_quyen', '')
+        if isinstance(thu_muc, (list, tuple)):
+            thu_muc = thu_muc[0] if thu_muc else ''
         # P1.3: bo sung dinh danh nguon de mo dung tai lieu goc
         doc_id = doc.metadata.get('doc_id')
         site = doc.metadata.get('site')

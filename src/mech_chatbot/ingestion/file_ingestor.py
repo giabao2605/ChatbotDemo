@@ -15,7 +15,7 @@ vision_model = build_vision_model()
 def learn_new_file(file_path, ten_file, thu_muc="Tu_Hoc", progress_callback=None,
                    domain_override=None, security_override=None,
                    cong_doan_override=None, site_override=None,
-                   scan_sensitive=False):
+                   scan_sensitive=False, phong_ban_override=None):
     """
     Doc file moi, trich xuat metadata, goi Gemini Vision va nap vao Qdrant DB.
 
@@ -40,6 +40,7 @@ def learn_new_file(file_path, ten_file, thu_muc="Tu_Hoc", progress_callback=None
         cong_doan_override=cong_doan_override,
         site_override=site_override,
         scan_sensitive=scan_sensitive,
+        phong_ban_override=phong_ban_override,
     )
     if ext in PDF_EXTENSIONS:
         report = process_and_ingest_pdf(file_path, ten_file, thu_muc, vision_model, progress_callback, **_ov)

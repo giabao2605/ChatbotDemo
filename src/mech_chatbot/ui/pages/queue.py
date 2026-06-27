@@ -47,7 +47,7 @@ def run_queue():
         )
     with fc2:
         if is_admin:
-            dept_options = [d["code"] for d in list_known_departments(active_only=False)]
+            dept_options = [d["code"] for d in list_known_departments(active_only=True)]
         else:
             dept_options = [d for d in (current_user.get("allowed_departments") or [current_user.get("department")]) if d]
         dept_filter = st.selectbox("Phòng ban", ["Tất cả"] + sorted(set(dept_options)))
@@ -121,7 +121,6 @@ def run_queue():
                 st.write(
                     f"**Domain:** {domain_val or 'theo thư mục'} | "
                     f"**Mức mật:** {security_val or 'theo thư mục'}"
-                    + (f" | **Công đoạn:** {cong_doan_val}" if cong_doan_val else "")
                     + (f" | **Site:** {site_val}" if site_val else "")
                 )
                 st.write(f"**Trạng thái:** <span style='color:{color}'>{status}</span> (Tiến độ: {progress_percent}%)", unsafe_allow_html=True)

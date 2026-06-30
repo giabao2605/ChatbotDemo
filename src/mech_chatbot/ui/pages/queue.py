@@ -53,7 +53,7 @@ def run_queue():
     with fc1:
         status_filter = st.selectbox(
             t("Tr\u1ea1ng th\u00e1i"),
-            [t("T\u1ea5t c\u1ea3"), "pending", "pending_retry", "classifying", "extracting", "embedding", "failed", "waiting_quota"],
+            [t("T\u1ea5t c\u1ea3"), "pending", "pending_retry", "classifying", "extracting", "embedding", "failed", "waiting_quota", "publishing"],
             key="queue_status",
         )
     with fc2:
@@ -117,6 +117,11 @@ def run_queue():
 
         st.subheader(t("T\u1ed5ng s\u1ed1: {n} jobs", n=len(jobs)))
 
+        selected_job_ids = []
+        select_all_jobs = False
+        if is_admin:
+            select_all_jobs = st.checkbox(t("Chọn tất cả jobs đang hiển thị"), key="queue_select_all_jobs")
+
         for job in jobs:
             (
                 job_id, ten_file, thu_muc, status, error_message,
@@ -126,6 +131,10 @@ def run_queue():
                 priority,
                 domain_val, security_val, cong_doan_val, site_val
             ) = job
+
+            if is_admin:
+                if st.checkbox(f"Chọn Job {job_id} · {ten_file}", value=select_all_jobs, key=f"queue_pick_{job_id}"):
+                    selected_job_ids.append(job_id)
 
             prio_badge = ("\U0001f525 GAP" if (priority or 100) < 50
                           else ("\u2b07\ufe0f " + t("th\u1ea5p") if (priority or 100) > 150
@@ -197,6 +206,34 @@ def run_queue():
                                 st.rerun()
                             else:
                                 st.error(t("Th\u1eed l\u1ea1i th\u1ea5t b\u1ea1i."))
+
+        if is_admin and selected_job_ids:
+            st.markdown("---")
+            st.warning(t("Đã chọn {n} job.", n=len(selected_job_ids)))
+            if st.button("🗑️ " + t("Xóa tất cả jobs đã chọn"), key="queue_bulk_delete_btn", type="secondary"):
+                st.session_state["queue_confirm_bulk_delete"] = selected_job_ids
+
+        if is_admin and st.session_state.get("queue_confirm_bulk_delete"):
+            ids = st.session_state["queue_confirm_bulk_delete"]
+            st.error(t("Xác nhận xóa {n} job?", n=len(ids)))
+            c_ok, c_cancel = st.columns(2)
+            with c_ok:
+                if st.button("✅ " + t("Xác nhận xóa"), key="queue_confirm_bulk_delete_btn", type="primary"):
+                    ok, fail = 0, 0
+                    with engine.begin() as conn:
+                        for jid in ids:
+                            try:
+                                conn.execute(text("DELETE FROM dbo.IngestionJobs WHERE JobID = :jid"), {"jid": jid})
+                                ok += 1
+                            except Exception:
+                                fail += 1
+                    st.session_state.pop("queue_confirm_bulk_delete", None)
+                    st.success(t("Đã xóa: {ok} thành công, {fail} thất bại.", ok=ok, fail=fail))
+                    st.rerun()
+            with c_cancel:
+                if st.button(t("Hủy"), key="queue_cancel_bulk_delete"):
+                    st.session_state.pop("queue_confirm_bulk_delete", None)
+                    st.rerun()
 
     except Exception as e:
         st.error(t("L\u1ed7i truy xu\u1ea5t d\u1eef li\u1ec7u: {e}", e=e))

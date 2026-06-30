@@ -76,7 +76,8 @@ def run_documents():
     params = {}
     filters = []
 
-    filters.append("d.LifecycleStatus <> 'deleting'")
+    filters.append("d.LifecycleStatus IN ('published', 'archived', 'superseded')")
+    filters.append("d.ReviewStatus = 'approved'")
 
     if not is_admin:
         if allowed_departments:
@@ -121,7 +122,7 @@ def run_documents():
                d.Title, d.Tags, d.Summary, d.VersionNo, d.IsCurrent AS IsCurrentVersion,
                d.UploadedBy, d.NgayTaiLen AS CreatedAt, d.ExpiryDate, d.EffectiveStatus,
                d.EffectiveDate AS EffectiveDateStart, d.ReviewDate, d.OwnerSigner, d.DocLanguage AS Language,
-               d.DocNumber, d.Site, d.VariantGroup, d.VariantCode AS BranchLabel
+               d.DocNumber, d.Site, d.VariantGroup, d.VariantCode AS BranchLabel, d.LifecycleStatus, d.ReviewStatus
         FROM TaiLieu d
         {where_clause}
         ORDER BY d.NgayTaiLen DESC
@@ -138,14 +139,22 @@ def run_documents():
         st.info(t("Kh\u00f4ng t\u00ecm th\u1ea5y t\u00e0i li\u1ec7u n\u00e0o."))
         return
 
+    selected_doc_ids = []
+    select_all_docs = False
+    if is_admin:
+        select_all_docs = st.checkbox(t("Chọn tất cả tài liệu đang hiển thị"), key="docs_select_all")
+
     for row in rows:
         (
             doc_id, original_file_name, department, domain, security_level,
             title, tags, summary, version_no, is_current,
             uploaded_by, created_at, expiry_date, effective_status,
             effective_date_start, review_date, owner_signer, language,
-            doc_number, site, variant_group, branch_label
+            doc_number, site, variant_group, branch_label, lifecycle_status, review_status
         ) = row
+        if is_admin:
+            if st.checkbox(f"Chọn DocID {doc_id} · {original_file_name}", value=select_all_docs, key=f"docs_pick_{doc_id}"):
+                selected_doc_ids.append(doc_id)
         render_document_row(
             doc_id=doc_id, original_file_name=original_file_name, department=department,
             domain=domain, security_level=security_level, title=title, tags=tags,
@@ -156,6 +165,36 @@ def run_documents():
             doc_number=doc_number, site=site, variant_group=variant_group,
             branch_label=branch_label, is_admin=is_admin,
         )
+
+    if is_admin and selected_doc_ids:
+        st.markdown("---")
+        st.warning(t("Đã chọn {n} tài liệu.", n=len(selected_doc_ids)))
+        if st.button("🗑️ " + t("Xóa tất cả tài liệu đã chọn"), type="secondary", key="docs_bulk_delete_btn"):
+            st.session_state["docs_confirm_bulk_delete"] = selected_doc_ids
+
+    if is_admin and st.session_state.get("docs_confirm_bulk_delete"):
+        ids = st.session_state["docs_confirm_bulk_delete"]
+        st.error(t("Xác nhận xóa vĩnh viễn {n} tài liệu?", n=len(ids)))
+        c_ok, c_cancel = st.columns(2)
+        with c_ok:
+            if st.button("✅ " + t("Xác nhận xóa"), key="docs_confirm_bulk_delete_btn", type="primary"):
+                actor = (auth.get_current_user() or {}).get("username") or "System"
+                ok, fail = 0, 0
+                for did in ids:
+                    try:
+                        if delete_document_completely(did, reviewer=actor):
+                            ok += 1
+                        else:
+                            fail += 1
+                    except Exception:
+                        fail += 1
+                st.session_state.pop("docs_confirm_bulk_delete", None)
+                st.success(t("Đã xóa: {ok} thành công, {fail} thất bại.", ok=ok, fail=fail))
+                st.rerun()
+        with c_cancel:
+            if st.button(t("Hủy"), key="docs_cancel_bulk_delete"):
+                st.session_state.pop("docs_confirm_bulk_delete", None)
+                st.rerun()
 
 
 def render_document_row(

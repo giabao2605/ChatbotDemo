@@ -6,7 +6,11 @@ import streamlit as st
 from sqlalchemy import text
 
 from mech_chatbot.auth import service as auth
-from mech_chatbot.db.repository import engine, update_document_common_metadata
+from mech_chatbot.db.repository import (
+    engine, update_document_common_metadata,
+    publish_as_new_version, publish_as_new_variant, publish_as_standalone,
+    delete_document_completely,
+)
 from mech_chatbot.ui import metadata_forms
 from mech_chatbot.ui.i18n import t
 
@@ -120,7 +124,12 @@ def _render_review_item(
             + (f" | **Site:** {job_site}" if job_site else "")
         )
         if extraction_report:
-            with st.expander(t("Xem k\u1ebft qu\u1ea3 tr\u00edch xu\u1ea5t"), expanded=False):
+            show_report = st.checkbox(
+                t("Xem kết quả trích xuất"),
+                value=False,
+                key=f"show_extraction_report_{job_id}",
+            )
+            if show_report:
                 try:
                     st.json(json.loads(extraction_report))
                 except Exception:
@@ -196,7 +205,6 @@ def _process_review_action(job_id, action_choice, meta, doc_id, reject_reason, v
             st.rerun()
             return
 
-        publish_status = "publishing"
         if "\u0111\u1ed9c l\u1eadp" in action_choice:
             publish_mode = "standalone"
         elif "variant m\u1edbi" in action_choice:
@@ -205,27 +213,64 @@ def _process_review_action(job_id, action_choice, meta, doc_id, reject_reason, v
             publish_mode = "new_version"
 
         _save_meta_to_doc(doc_id, meta)
+        _publish_doc_and_mark_job(job_id, doc_id, publish_mode)
 
-        with engine.begin() as conn:
-            if publish_mode == "new_version" and variant_group:
-                conn.execute(text("""
-                    UPDATE TaiLieu SET IsCurrent = 0
-                    WHERE VariantGroup = :vg AND DocID <> :did
-                """), {"vg": variant_group, "did": doc_id})
-            conn.execute(text("""
-                UPDATE TaiLieu SET IsCurrent = 1 WHERE DocID = :did
-            """), {"did": doc_id})
-            conn.execute(text("""
-                UPDATE IngestionJobs
-                SET Status = :status, UpdatedAt = GETDATE()
-                WHERE JobID = :jid
-            """), {"status": publish_status, "jid": job_id})
-
-        st.success(t("\u0110\u00e3 chuy\u1ec3n sang tr\u1ea1ng th\u00e1i publishing. Worker s\u1ebd push l\u00ean Qdrant."))
+        st.success(t("Đã xuất bản tài liệu. Chatbot có thể dùng sau khi payload Qdrant cập nhật."))
         st.rerun()
 
     except Exception as e:
         st.error(t("L\u1ed7i x\u1eed l\u00fd: {e}", e=e))
+
+
+def _current_reviewer():
+    try:
+        user = auth.get_current_user() or {}
+        return user.get("username") or user.get("display_name") or "System"
+    except Exception:
+        return "System"
+
+
+def _publish_doc_and_mark_job(job_id, doc_id, publish_mode="standalone"):
+    """Publish DONG BO ngay trong Admin UI.
+
+    Flow cu set IngestionJobs.Status='publishing' roi cho worker, nhung worker
+    khong pick status 'publishing' -> job bi ket, Kho tai lieu hien sai.
+    Flow moi:
+      pending_review -> publish_as_*() update SQL + Qdrant payload
+      -> IngestionJobs.Status='published'
+    """
+    if not doc_id:
+        raise RuntimeError("Không tìm thấy DocID tương ứng với job này.")
+
+    reviewer = _current_reviewer()
+    if publish_mode == "new_version":
+        ok = publish_as_new_version(doc_id, reviewer=reviewer)
+    elif publish_mode == "new_variant":
+        ok = publish_as_new_variant(doc_id, reviewer=reviewer)
+    else:
+        ok = publish_as_standalone(doc_id, reviewer=reviewer)
+
+    if not ok:
+        raise RuntimeError("Publish thất bại: không tìm thấy tài liệu hoặc không update được Qdrant.")
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE IngestionJobs
+            SET Status = 'published', UpdatedAt = GETDATE()
+            WHERE JobID = :jid
+        """), {"jid": job_id})
+
+
+def _delete_review_job_and_doc(job_id, doc_id=None):
+    reviewer = _current_reviewer()
+    if doc_id:
+        try:
+            delete_document_completely(doc_id, reviewer=reviewer)
+        except Exception:
+            # Neu xoa doc loi, van tiep tuc xoa job de UI khong ket; loi se hien trong log.
+            pass
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM IngestionJobs WHERE JobID = :jid"), {"jid": job_id})
 
 
 def _save_meta_to_doc(doc_id, meta):
@@ -254,80 +299,103 @@ def _save_meta_to_doc(doc_id, meta):
 # ---------------------------------------------------------------------------
 
 def _render_bulk_panel():
-    st.subheader(t("Bulk action tr\u00ean jobs"))
+    st.subheader(t("Bulk action trên jobs"))
     st.caption(t(
-        "Ch\u1ecdn nhi\u1ec1u job c\u00f9ng l\u00fac \u0111\u1ec3 Approve, Reject, ho\u1eb7c x\u00f3a."
+        "Chọn nhiều job cùng lúc để publish, reject hoặc xóa. "
+        "Publish sẽ chạy trực tiếp, không còn kẹt ở trạng thái publishing."
     ))
     with engine.connect() as conn:
         rows = conn.execute(text("""
-            SELECT JobID, TenFile, ThuMuc, Status, UpdatedAt
-            FROM IngestionJobs
-            WHERE Status IN ('pending_review', 'failed', 'rejected')
-            ORDER BY UpdatedAt ASC
+            SELECT j.JobID, j.TenFile, j.ThuMuc, j.Status, j.UpdatedAt, d.DocID
+            FROM IngestionJobs j
+            LEFT JOIN TaiLieu d
+              ON d.TenFile = j.TenFile
+             AND d.ThuMuc = j.ThuMuc
+             AND d.LifecycleStatus <> 'deleting'
+            WHERE j.Status IN ('pending_review', 'failed', 'rejected', 'publishing')
+            ORDER BY j.UpdatedAt ASC
         """)).fetchall()
 
     if not rows:
-        st.info(t("Kh\u00f4ng c\u00f3 job n\u00e0o \u0111\u1ee7 \u0111i\u1ec1u ki\u1ec7n."))
+        st.info(t("Không có job nào đủ điều kiện."))
         return
 
-    selected_ids = []
-    for job_id, ten_file, thu_muc, status, updated_at in rows:
+    select_all = st.checkbox(t("Chọn tất cả jobs đang hiển thị"), key="bulk_select_all_jobs")
+    selected = []
+    for job_id, ten_file, thu_muc, status, updated_at, doc_id in rows:
         checked = st.checkbox(
-            f"[{status}] {ten_file} ({thu_muc}) \u00b7 {updated_at}",
+            f"[{status}] {ten_file} ({thu_muc}) · {updated_at}",
+            value=select_all,
             key=f"bulk_chk_{job_id}",
         )
         if checked:
-            selected_ids.append(job_id)
+            selected.append({"job_id": job_id, "doc_id": doc_id, "status": status})
 
-    st.markdown(f"**" + t("\u0110\u00e3 ch\u1ecdn: {n} job", n=len(selected_ids)) + "**")
+    st.markdown(f"**" + t("Đã chọn: {n} job", n=len(selected)) + "**")
+    publish_mode_label = st.selectbox(
+        t("Kiểu publish hàng loạt"),
+        [
+            ("standalone", t("Publish như tài liệu độc lập")),
+            ("new_variant", t("Publish song song như variant mới")),
+            ("new_version", t("Publish làm version mới")),
+        ],
+        format_func=lambda x: x[1],
+        key="bulk_publish_mode",
+    )
+    publish_mode = publish_mode_label[0]
+
     c1, c2, c3 = st.columns(3)
     with c1:
-        if st.button(t("Approve t\u1ea5t c\u1ea3 \u0111\u00e3 ch\u1ecdn"), type="primary", disabled=not selected_ids):
-            results = _run_bulk(selected_ids, action="approve")
-            st.expander(t("K\u1ebft qu\u1ea3"), expanded=True).write(results)
+        if st.button(t("Publish tất cả đã chọn"), type="primary", disabled=not selected):
+            ok, fail = _run_bulk_review(selected, action="publish", publish_mode=publish_mode)
+            st.success(t("Publish: {ok} thành công, {fail} thất bại.", ok=ok, fail=fail))
             st.rerun()
     with c2:
-        if st.button(t("Reject t\u1ea5t c\u1ea3 \u0111\u00e3 ch\u1ecdn"), disabled=not selected_ids):
-            results = _run_bulk(selected_ids, action="reject")
-            st.expander(t("K\u1ebft qu\u1ea3"), expanded=True).write(results)
+        if st.button(t("Reject tất cả đã chọn"), disabled=not selected):
+            ok, fail = _run_bulk_review(selected, action="reject")
+            st.success(t("Reject: {ok} thành công, {fail} thất bại.", ok=ok, fail=fail))
             st.rerun()
     with c3:
-        if st.button(t("X\u00f3a t\u1ea5t c\u1ea3 \u0111\u00e3 ch\u1ecdn"), disabled=not selected_ids, type="secondary"):
-            st.session_state["confirm_bulk_del"] = selected_ids
+        if st.button(t("Xóa tất cả đã chọn"), disabled=not selected, type="secondary"):
+            st.session_state["confirm_bulk_del"] = selected
+
     if st.session_state.get("confirm_bulk_del"):
-        st.warning(t("X\u00e1c nh\u1eadn x\u00f3a {n} job? Kh\u00f4ng th\u1ec3 ho\u00e0n t\u00e1c.", n=len(st.session_state["confirm_bulk_del"])))
+        st.warning(t("Xác nhận xóa {n} job/tài liệu? Không thể hoàn tác.", n=len(st.session_state["confirm_bulk_del"])))
         cc1, cc2 = st.columns(2)
         with cc1:
-            if st.button("\u2705 " + t("X\u00e1c nh\u1eadn"), key="confirm_bulk_del_btn", type="primary"):
-                results = _run_bulk(st.session_state["confirm_bulk_del"], action="delete")
+            if st.button("✅ " + t("Xác nhận"), key="confirm_bulk_del_btn", type="primary"):
+                ok, fail = _run_bulk_review(st.session_state["confirm_bulk_del"], action="delete")
                 st.session_state.pop("confirm_bulk_del", None)
-                st.success(t("\u0110\u00e3 x\u00f3a.") + " " + results)
+                st.success(t("Đã xóa: {ok} thành công, {fail} thất bại.", ok=ok, fail=fail))
                 st.rerun()
         with cc2:
-            if st.button(t("H\u1ee7y"), key="cancel_bulk_del"):
+            if st.button(t("Hủy"), key="cancel_bulk_del"):
                 st.session_state.pop("confirm_bulk_del", None)
                 st.rerun()
 
 
-def _run_bulk(job_ids, action):
+def _run_bulk_review(items, action, publish_mode="standalone"):
     ok, fail = 0, 0
-    for jid in job_ids:
+    for item in items:
         try:
-            with engine.begin() as conn:
-                if action == "approve":
+            jid = item["job_id"] if isinstance(item, dict) else item
+            did = item.get("doc_id") if isinstance(item, dict) else None
+            if action == "publish":
+                if not did:
+                    raise RuntimeError("Thiếu DocID để publish")
+                _publish_doc_and_mark_job(jid, did, publish_mode=publish_mode)
+            elif action == "reject":
+                with engine.begin() as conn:
                     conn.execute(text("""
-                        UPDATE IngestionJobs SET Status = 'publishing', UpdatedAt = GETDATE() WHERE JobID = :jid
+                        UPDATE IngestionJobs SET Status = 'rejected', UpdatedAt = GETDATE()
+                        WHERE JobID = :jid
                     """), {"jid": jid})
-                elif action == "reject":
-                    conn.execute(text("""
-                        UPDATE IngestionJobs SET Status = 'rejected', UpdatedAt = GETDATE() WHERE JobID = :jid
-                    """), {"jid": jid})
-                elif action == "delete":
-                    conn.execute(text("DELETE FROM IngestionJobs WHERE JobID = :jid"), {"jid": jid})
+            elif action == "delete":
+                _delete_review_job_and_doc(jid, did)
             ok += 1
         except Exception:
             fail += 1
-    return t("{ok} th\u00e0nh c\u00f4ng, {fail} th\u1ea5t b\u1ea1i.", ok=ok, fail=fail)
+    return ok, fail
 
 
 # ---------------------------------------------------------------------------

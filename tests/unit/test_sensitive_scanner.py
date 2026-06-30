@@ -64,18 +64,10 @@ class TestKnownRisks:
     """Cac test ghi lai RUI RO da phat hien khi audit. xfail = 'biet truoc se fail'.
     Khi nao fix xong, bo strict/xfail de bien thanh test bao ve that su."""
 
-    @pytest.mark.xfail(
-        reason="RUI RO #1: chi quet max_chars dau -> noi dung nhay cam o cuoi file dai bi bo sot",
-        strict=False,
-    )
     def test_long_document_tail_should_still_be_scanned(self):
         text = ("x" * 50000) + " BANG LUONG nhan vien"
         assert scan_sensitive_content(text)["is_sensitive"] is True
 
-    @pytest.mark.xfail(
-        reason="RUI RO #2: \\b\\d{9}\\b coi ma part/so luong 9-12 chu so la CCCD -> duong tinh gia",
-        strict=False,
-    )
     def test_nine_digit_part_code_should_not_be_national_id(self):
         # Ma so ky thuat 9 chu so KHONG nen bi coi la CMND
         assert scan_sensitive_content("Ma part 123456789 so luong 100")["is_sensitive"] is False

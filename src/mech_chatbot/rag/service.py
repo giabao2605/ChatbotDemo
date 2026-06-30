@@ -31,6 +31,11 @@ import json
 from mech_chatbot.llm.llm_client import cohere_invoke, get_cohere_llm, _is_cohere_rate_limit, gpt_rerank_documents, get_llm_model_name
 from mech_chatbot.db.repository import search_bom_by_code
 from mech_chatbot.rag.rbac import compose_retrieval_filters
+from mech_chatbot.rag.entity_resolver import (
+    extract_no_code_constraints,
+    resolve_candidates_from_docs,
+    build_candidate_table_markdown,
+)
  
 logger.info("Dang khoi dong he thong RAG AI...")
  
@@ -190,7 +195,7 @@ _COMMON_RULES_VI = (
     "sự, chỉ trình bày đúng những gì tài liệu nội bộ ghi; không đưa ý kiến tư vấn cá nhân, "
     "không khẳng định quy định pháp luật ngoài tài liệu.\n"
     "7. CHỐNG SUY DIỄN SỐ LIỆU: Không tự ước lượng thời gian, chi phí, số tiền, số lượng, "
-    "ngày/giờ, tỉ lệ, định mức... nếu tài liệu không ghi rõ. Không tạo con số giả định.\n"
+    "ngày/giờ, tỉ lệ, định mức... nếu tài liệu không ghi rõ. Không tạo con số gi�� định.\n"
     "8. QUY TẮC TÍNH TOÁN: Chỉ tính toán khi TẤT CẢ dữ kiện đầu vào xuất hiện rõ trong phần "
     "dữ liệu. Thiếu bất kỳ dữ kiện nào phải từ chối và nói rõ đang thiếu gì. Khi tính, nêu "
     "công thức và nguồn của từng số.\n"
@@ -723,7 +728,17 @@ def extract_search_intent(question, current_part_ids=None, user_department=None,
     - "version_history": user hỏi lịch sử version
     - "all_current_variants": user hỏi mã có nhiều variant cùng lưu hành
     5. "query_type": "general_lookup" hoac "bom_lookup" (hoi vat tu, bang ke).
-    
+    6. "product_names": Mang ten san pham/chi tiet neu user mo ta (vd: ["Khung sat + inox 201"]). Neu khong co, tra ve [].
+    7. "materials": Mang vat lieu neu user nhac (vd: ["inox 201", "SUS304", "SS400"]). Neu khong co, tra ve [].
+    8. "dimensions": Mang kich thuoc neu user nhac (vd: ["381x470x990.6mm"]). Neu khong co, tra ve [].
+    9. "models": Mang model/variant neu user nhac (vd: ["Model7"]). Neu khong co, tra ve [].
+    10. "query_scope": mot trong "single_candidate" (hoi 1 san pham cu the), "compare_candidates" (hoi nhieu/so sanh/tat ca model), "general_policy" (hoi quy trinh/tieu chuan chung khong gan tai lieu cu the).
+    11. "need_disambiguation": true neu can hoi lai de chon dung tai lieu, nguoc lai false.
+
+    Quy tac quan trong: Neu user KHONG dua ma ban ve nhung co ten san pham, vat lieu,
+    hoac kich thuoc, hay trich xuat vao product_names/materials/dimensions/models.
+    TUYET DOI KHONG tu bia ra ma ban ve (base_codes) khi user khong cung cap.
+
     Luu y: Chi tra ve dung JSON, khong giai thich gi them.
     """
  
@@ -732,7 +747,13 @@ def extract_search_intent(question, current_part_ids=None, user_department=None,
         "detected_versions": [],
         "variant_codes": [],
         "version_policy": "current_only",
-        "query_type": "general_lookup"
+        "query_type": "general_lookup",
+        "product_names": [],
+        "materials": [],
+        "dimensions": [],
+        "models": [],
+        "query_scope": "single_candidate",
+        "need_disambiguation": False,
     }
 
     force_llm = bool(re.search(r'\bv\d+\b|version|so sanh|khac nhau|cu\b|moi nhat|archive', question, re.IGNORECASE))
@@ -767,6 +788,17 @@ def extract_search_intent(question, current_part_ids=None, user_department=None,
             intent_data["variant_codes"] = [str(v) for v in parsed.get("variant_codes", []) if v]
             intent_data["version_policy"] = parsed.get("version_policy", "current_only")
             intent_data["query_type"] = parsed.get("query_type", "general_lookup")
+            # --- Mo rong (no-code resolver): cong them field, khong pha field cu ---
+            intent_data["product_names"] = [str(v) for v in parsed.get("product_names", []) if v]
+            intent_data["materials"] = [str(v) for v in parsed.get("materials", []) if v]
+            intent_data["dimensions"] = [str(v) for v in parsed.get("dimensions", []) if v]
+            intent_data["models"] = [str(v) for v in parsed.get("models", []) if v]
+            intent_data["query_scope"] = parsed.get("query_scope", "single_candidate")
+            intent_data["need_disambiguation"] = bool(parsed.get("need_disambiguation", False))
+            # Neu LLM bat duoc model/variant ma chua co o variant_codes -> bo sung
+            for _m in intent_data["models"]:
+                if _m and _m not in intent_data["variant_codes"]:
+                    intent_data["variant_codes"].append(_m)
         except concurrent.futures.TimeoutError:
             future.cancel()
             logger.warning(f"LLM Intent Extraction bi timeout. Fallback ve Regex.")
@@ -780,6 +812,19 @@ def extract_search_intent(question, current_part_ids=None, user_department=None,
 
     if det_policy:
         intent_data["version_policy"] = det_policy
+
+    # Muc 5: keyword "cac model / tat ca / so sanh" -> coi nhu hoi tat ca variant,
+    # khong hoi lai chon model. Dung khong dau de bat ca 2 kieu go.
+    from mech_chatbot.rag.text_utils import remove_accents as _ra_intent
+    _q_all_kw = _ra_intent(question.lower())
+    ALL_VARIANT_KEYWORDS = [
+        "cac model", "tat ca model", "tat ca cac model", "moi model",
+        "tung model", "cac variant", "tat ca variant", "so sanh cac model",
+        "so sanh model",
+    ]
+    if any(kw in _q_all_kw for kw in ALL_VARIANT_KEYWORDS):
+        intent_data["version_policy"] = "all_current_variants"
+        intent_data["query_scope"] = "compare_candidates"
 
     from mech_chatbot.db.repository import normalize_base_code
     extracted_codes = [normalize_base_code(c) for c in intent_data["base_codes"] if c]
@@ -1472,19 +1517,85 @@ def chat_with_rag(user_question, image_path=None, chat_history=None, current_par
         return insufficient_evidence_stream(), "", [], current_part_ids, make_debug_info([])
 
     if not skip_retrieval:
-        # Rule 3: Nhieu variant thi phai hoi lai (tru khi muon so sanh)
-        if retrieved_docs and "intent_data" in locals() and intent_data.get("version_policy") not in ["compare_versions", "all_current_variants"]:
+        # Rule 3 (NANG CAP): khi co nhieu variant/base_code, KHONG voi tu choi.
+        # Truoc tien thu DISAMBIGUATE bang rang buoc trong cau hoi (ten san pham,
+        # vat lieu, kich thuoc). Chi hoi lai khi that su khong tach duoc.
+        from mech_chatbot.rag.text_utils import remove_accents as _ra
+        _qn_all = _ra(user_question.lower())
+        _all_kw = [
+            "cac model", "tat ca model", "tat ca cac model", "moi model",
+            "tung model", "cac variant", "tat ca variant", "so sanh",
+        ]
+        _wants_all = (
+            ("intent_data" in locals() and intent_data.get("version_policy") in ["compare_versions", "all_current_variants"])
+            or any(k in _qn_all for k in _all_kw)
+        )
+
+        if retrieved_docs and not _wants_all:
+            # Tap hop cac "ho" tai lieu khac nhau (base_code + variant_code)
+            distinct_families = set()
             unique_variants = set()
             for doc in retrieved_docs:
-                var_code = doc.metadata.get("variant_code")
-                if var_code and var_code != "default":
-                    unique_variants.add(var_code)
-            if len(unique_variants) > 1:
-                logger.info(f"Phat hien nhieu variant {unique_variants}. Yeu cau xac minh.")
-                def variant_ambiguity_stream():
-                    yield f"Mình tìm thấy nhiều variant/model liên quan ({', '.join(unique_variants)}). Vui lòng chọn Model cụ thể hoặc yêu cầu 'So sánh các model' trước khi mình kết luận."
-                log_trace("rag_end", trace_id, final_latency_ms=int((time.time() - t_start)*1000), refusal=True, reason="multiple_variants")
-                return variant_ambiguity_stream(), "", [], current_part_ids, make_debug_info([])
+                _md = doc.metadata or {}
+                _bc = (_md.get("base_code") or "").strip()
+                _vc = (_md.get("variant_code") or "default").strip()
+                distinct_families.add((_bc, _vc))
+                if _vc and _vc != "default":
+                    unique_variants.add(_vc)
+
+            # Kich hoat resolver khi:
+            #  - co nhieu variant (nhu logic cu), HOAC
+            #  - cau hoi KHONG co ma nhung mo ta san pham va co nhieu ho tai lieu.
+            _constraints = extract_no_code_constraints(user_question)
+            # Gop them rang buoc do LLM intent trich (product_names/materials/dimensions/models)
+            if "intent_data" in locals():
+                from mech_chatbot.rag.entity_resolver import _norm_text as _nt, _norm_dim as _nd
+                for _nm in (intent_data.get("product_names") or []):
+                    _v = _nt(_nm)
+                    if _v and _v not in _constraints["quoted_names"]:
+                        _constraints["quoted_names"].append(_v)
+                for _mt in (intent_data.get("materials") or []):
+                    _v = _nt(_mt)
+                    if _v and _v not in _constraints["materials"]:
+                        _constraints["materials"].append(_v)
+                for _dm in (intent_data.get("dimensions") or []):
+                    _v = _nd(_dm)
+                    if _v and _v not in _constraints["dimensions"]:
+                        _constraints["dimensions"].append(_v)
+            _has_constraints = any(_constraints.values())
+            _need_disambig = (len(unique_variants) > 1) or (
+                not new_part_ids and _has_constraints and len(distinct_families) > 1
+            )
+
+            if _need_disambig:
+                resolution = resolve_candidates_from_docs(retrieved_docs, _constraints)
+                if resolution["decision"] == "single":
+                    _sel = resolution["selected"]
+                    logger.info(f"Disambiguation: chot 1 candidate {_sel.get('key')} tu rang buoc {_constraints}.")
+                    retrieved_docs = resolution["selected_docs"] or retrieved_docs
+                elif resolution["decision"] == "ambiguous":
+                    logger.info(f"Nhieu candidate sau disambiguation: {[c.get('key') for c in resolution['candidates']]}.")
+                    _table_md = build_candidate_table_markdown(resolution["candidates"])
+                    def variant_ambiguity_stream():
+                        yield (
+                            "Mình tìm thấy nhiều tài liệu có thể khớp với mô tả của bạn. "
+                            "Bạn muốn tra theo tài liệu nào dưới đây?\n\n"
+                            + _table_md
+                            + "\n\nBạn có thể trả lời bằng mã/model ở cột đầu, hoặc yêu cầu 'so sánh các model' để mình lập bảng đối chiếu."
+                        )
+                    log_trace("rag_end", trace_id, final_latency_ms=int((time.time() - t_start)*1000), refusal=True, reason="multiple_candidates_need_choice")
+                    return variant_ambiguity_stream(), "", [], current_part_ids, make_debug_info([])
+                elif resolution["decision"] == "insufficient":
+                    # Co mo ta nhung khong tai lieu nao khop du chac -> xin them thong tin.
+                    logger.info(f"Khong resolve duoc candidate du chac voi rang buoc {_constraints}.")
+                    def insufficient_candidate_stream():
+                        yield (
+                            "Mình chưa xác định chắc chắn được tài liệu/bản vẽ cần tra theo mô tả của bạn. "
+                            "Bạn vui lòng cung cấp thêm mã bản vẽ, model, tên sản phẩm, kích thước hoặc vật liệu cụ thể hơn nhé."
+                        )
+                    log_trace("rag_end", trace_id, final_latency_ms=int((time.time() - t_start)*1000), refusal=True, reason="no_confident_candidate")
+                    return insufficient_candidate_stream(), "", [], current_part_ids, make_debug_info([])
+                # decision == "pass": de nguyen, tra loi binh thuong
 
         log_trace("retrieval", trace_id, 
                   latency_ms=int((time.time() - t_retrieval)*1000),

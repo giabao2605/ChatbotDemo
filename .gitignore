@@ -9,6 +9,7 @@ __pycache__/
 # Data (raw & processed)
 data/raw/
 data/processed/
+data/cache/
 
 # Logs & Temp
 logs/

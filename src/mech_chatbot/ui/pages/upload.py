@@ -6,6 +6,7 @@ from mech_chatbot.auth import service as auth
 from mech_chatbot.db.repository import create_ingestion_job
 from mech_chatbot.ui import metadata_forms
 from mech_chatbot.ui.i18n import t
+from mech_chatbot.ui.labels import dept_label, gloss
 
 SUPPORTED_LEARNING_EXTENSIONS = {
     ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv", ".txt", ".md",

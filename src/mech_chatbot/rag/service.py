@@ -986,6 +986,86 @@ def extract_search_intent(question, current_part_ids=None, user_department=None,
     
     return strict_filter, broad_filter, new_part_ids, is_inherited, is_bom_query, intent_data
  
+_CONTEXT_TIMEOUT = float(os.getenv("CONTEXT_TIMEOUT", "5.0"))
+
+
+def analyze_context(user_question, chat_history=None, current_part_ids=None):
+    """P0-1: Phan doan ngu canh hoi thoai + query rewriting (1 LLM call, co timeout).
+
+    Tra ve dict:
+      - context_action: continue | switch_topic | broaden
+      - standalone_question: cau hoi da viet lai thanh doc lap (hoac cau goc)
+
+    Fallback AN TOAN (giu nguyen hanh vi cu = ke thua State Memory + cau goc) khi:
+    tat tinh nang, chua co ngu canh, loi parse hoac timeout.
+    """
+    fallback = {"context_action": "continue", "standalone_question": user_question}
+    if not env_bool("ENABLE_QUERY_REWRITE", True):
+        return fallback
+    if not chat_history or not current_part_ids:
+        return fallback
+
+    hist_lines = []
+    for msg in chat_history[-6:]:
+        role = "Khach" if msg.get("role") == "user" else "Bot"
+        content = str(msg.get("content", ""))
+        if len(content) > 300:
+            content = content[:300] + " [...]"
+        hist_lines.append(f"{role}: {content}")
+    hist_str = chr(10).join(hist_lines)
+
+    template = """Ban la bo phan tich ngu canh hoi thoai cho he thong tra cuu tai lieu ky thuat.
+Ngu canh hien tai dang gan voi cac ma/tai lieu: __PARTIDS__.
+
+Lich su hoi thoai gan nhat:
+__HIST__
+
+Cau hoi moi cua nguoi dung: "__QUESTION__"
+
+Hay tra ve DUNG 1 JSON object theo schema (khong markdown):
+{
+  "context_action": "continue | switch_topic | broaden",
+  "standalone_question": "cau hoi day du, doc lap, khong con dai tu chi dinh"
+}
+
+Quy tac:
+- continue: cau hoi moi VAN noi ve cung ma/tai lieu dang trong ngu canh. Viet lai standalone_question de bo sung ro ma/tai lieu dang noi toi.
+- switch_topic: cau hoi chuyen sang ma/san pham/chu de KHAC. Khong gan vao ma cu.
+- broaden: cau hoi tong quat/liet ke toan bo (vd co nhung ma nao, tat ca san pham). Khong gan vao mot ma cu the.
+- standalone_question bang tieng Viet, giu nguyen y dinh goc; chi bo sung ngu canh khi context_action = continue.
+- CHI tra ve JSON, khong giai thich."""
+    prompt = (template
+              .replace("__PARTIDS__", str(current_part_ids))
+              .replace("__HIST__", hist_str)
+              .replace("__QUESTION__", str(user_question)))
+
+    def call_llm():
+        return cohere_invoke([HumanMessage(content=prompt)]).content
+
+    try:
+        future = _INTENT_EXECUTOR.submit(call_llm)
+        raw_response = future.result(timeout=_CONTEXT_TIMEOUT)
+        clean_json = raw_response.replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(clean_json)
+        action = parsed.get("context_action", "continue")
+        if action not in ("continue", "switch_topic", "broaden"):
+            action = "continue"
+        standalone = parsed.get("standalone_question") or user_question
+        if not isinstance(standalone, str) or not standalone.strip():
+            standalone = user_question
+        return {"context_action": action, "standalone_question": standalone.strip()}
+    except concurrent.futures.TimeoutError:
+        try:
+            future.cancel()
+        except Exception:
+            pass
+        logger.warning("analyze_context bi timeout -> fallback continue + cau goc.")
+        return fallback
+    except Exception as e:
+        logger.warning(f"Loi analyze_context: {e} -> fallback continue + cau goc.")
+        return fallback
+
+
 def rerank_docs(docs):
     priority = {
         "title_block": 0,
@@ -1378,6 +1458,126 @@ def current_published_filter(rbac_filter=None):
 # ==========================================
 # 4. HAM XU LY LOI (TRAI TIM CUA CHATBOT)
 # ==========================================
+_GLOSSARY_TTL = float(os.getenv("GLOSSARY_CACHE_TTL", "60"))
+_GLOSSARY_CACHE = {"ts": 0.0, "key": None, "data": []}
+
+
+def _glossary_domains_for_department(user_department):
+    """P0-3: domain glossary ap dung = generic + domain cua phong ban user."""
+    domains = ["generic"]
+    try:
+        if user_department:
+            from mech_chatbot.ingestion.domain_registry import resolve_domain_by_department
+            d = resolve_domain_by_department(user_department)
+            if d and d not in domains:
+                domains.append(d)
+    except Exception:
+        pass
+    return domains
+
+
+def _load_glossary_cached(domains):
+    key = tuple(sorted(domains or []))
+    now = time.time()
+    if _GLOSSARY_CACHE["key"] == key and (now - _GLOSSARY_CACHE["ts"]) < _GLOSSARY_TTL:
+        return _GLOSSARY_CACHE["data"]
+    try:
+        from mech_chatbot.db.repository import get_active_glossary
+        data = get_active_glossary(list(key) if key else None)
+    except Exception as e:
+        logger.warning(f"load glossary loi: {e}")
+        data = []
+    _GLOSSARY_CACHE["ts"] = now
+    _GLOSSARY_CACHE["key"] = key
+    _GLOSSARY_CACHE["data"] = data
+    return data
+
+
+def glossary_expansion_terms(text_in, user_department=None):
+    """P0-3: tra ve chuoi tu dong nghia/mo rong cho cac term glossary xuat hien trong text_in,
+    gioi han theo domain cua phong ban user (+ generic). Khop theo ranh gioi tu."""
+    if not text_in:
+        return ""
+    try:
+        from mech_chatbot.rag.text_utils import remove_accents
+        domains = _glossary_domains_for_department(user_department)
+        entries = _load_glossary_cached(domains)
+        if not entries:
+            return ""
+        norm_q = remove_accents(str(text_in).lower())
+        _wb = chr(92) + "b"
+
+        def _has(vn):
+            if not vn:
+                return False
+            try:
+                return re.search(_wb + re.escape(vn) + _wb, norm_q) is not None
+            except Exception:
+                return vn in norm_q
+
+        adds = []
+        seen = set()
+        for e in entries:
+            variants = [e.get("term", "")] + list(e.get("synonyms") or [])
+            matched = any(_has(remove_accents(str(v).lower())) for v in variants if v)
+            if not matched:
+                continue
+            extra = list(variants)
+            if e.get("expansion"):
+                extra.append(e["expansion"])
+            for v in extra:
+                if not v:
+                    continue
+                vn = remove_accents(str(v).lower())
+                if vn and not _has(vn) and vn not in seen:
+                    seen.add(vn)
+                    adds.append(str(v))
+        return " ".join(adds)
+    except Exception as e:
+        logger.warning(f"glossary_expansion_terms loi: {e}")
+        return ""
+
+
+def probe_restricted_access(query_text, user_department=None, allowed_departments=None,
+                            max_security_level="public", allowed_sites=None):
+    """P0-2: Kiem tra co ton tai tai lieu KHOP pham vi phong ban cua user nhung bi CHAN
+    CHI vi muc mat cao hon clearance. Tra ve (exists: bool, needed_level: str|None).
+    Best-effort, stateless; loi -> (False, None) de khong pha luong RAG.
+    """
+    try:
+        user_order = LEVEL_ORDER.get((max_security_level or "public"), 0)
+        allowed = list(allowed_departments) if allowed_departments else []
+        if user_department and user_department not in allowed:
+            allowed.append(user_department)
+        from mech_chatbot.config.constants import SHARE_ALL_DEPARTMENT as _SHARE
+        if _SHARE not in allowed:
+            allowed.append(_SHARE)
+        must = [
+            models.FieldCondition(key="metadata.lifecycle_status", match=models.MatchValue(value="published")),
+            models.FieldCondition(key="metadata.review_status", match=models.MatchValue(value="approved")),
+            models.FieldCondition(key="metadata.is_current", match=models.MatchValue(value=True)),
+            models.FieldCondition(key="metadata.phong_ban_quyen", match=models.MatchAny(any=allowed)),
+        ]
+        site_cond = _site_filter(allowed_sites)
+        if site_cond is not None:
+            must.append(site_cond)
+        probe_filter = models.Filter(must=must)
+        retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 10, "filter": probe_filter})
+        docs = retriever.invoke(query_text)
+        levels_above = []
+        for d in docs:
+            lvl = (d.metadata or {}).get("security_level") or "confidential"
+            if LEVEL_ORDER.get(lvl, 2) > user_order:
+                levels_above.append(lvl)
+        if levels_above:
+            needed = min(levels_above, key=lambda l: LEVEL_ORDER.get(l, 2))
+            return True, needed
+        return False, None
+    except Exception as e:
+        logger.warning(f"probe_restricted_access loi: {e}")
+        return False, None
+
+
 def chat_with_rag(user_question, image_path=None, chat_history=None, current_part_ids=None, user_department=None, user_roles=None, allowed_departments=None, max_security_level="public", allowed_sites=None, response_language="vi"):
     if chat_history is None:
         chat_history = []
@@ -1480,9 +1680,36 @@ def chat_with_rag(user_question, image_path=None, chat_history=None, current_par
     else:
         logger.info("Dang phan tich intent de tim kiem du lieu...")
         t_intent = time.time()
+
+        # === BUOC B0 (P0-1): PHAN DOAN NGU CANH + QUERY REWRITING ===
+        # Tu dong quyet dinh GIU / CLEAR State Memory (thay vi phu thuoc nut "Xoa ngu canh")
+        # va viet lai cau hoi noi tiep thanh cau doc lap TRUOC khi retrieve.
+        effective_question = user_question
+        effective_part_ids = current_part_ids
+        t_ctx = time.time()
+        ctx_result = analyze_context(user_question, chat_history, current_part_ids)
+        context_action = ctx_result["context_action"]
+        if context_action in ("switch_topic", "broaden"):
+            effective_part_ids = []  # Tu dong reset ngu canh khi doi chu de / hoi tong quat
+        if ctx_result.get("standalone_question"):
+            effective_question = ctx_result["standalone_question"]
+        if effective_question != user_question or effective_part_ids != current_part_ids:
+            logger.info(
+                f"[Context] action={context_action} | goc={user_question} -> "
+                f"rewrite={effective_question} | part_ids {current_part_ids}->{effective_part_ids}"
+            )
+        log_trace("context_analysis", trace_id,
+                  latency_ms=int((time.time() - t_ctx) * 1000),
+                  context_action=context_action,
+                  rewritten=(effective_question != user_question),
+                  original_question=user_question[:300],
+                  standalone_question=effective_question[:300],
+                  part_ids_before=current_part_ids,
+                  part_ids_after=effective_part_ids)
+
         rbac_filter = create_rbac_filter(user_department, user_roles, allowed_departments, max_security_level=max_security_level, allowed_sites=allowed_sites)
         strict_filter, broad_filter, new_part_ids, is_inherited, is_bom_query, intent_data = extract_search_intent(
-            user_question, current_part_ids, user_department, user_roles, allowed_departments, max_security_level, allowed_sites=allowed_sites
+            effective_question, effective_part_ids, user_department, user_roles, allowed_departments, max_security_level, allowed_sites=allowed_sites
         )
         
         log_trace("intent", trace_id, 
@@ -1508,14 +1735,14 @@ def chat_with_rag(user_question, image_path=None, chat_history=None, current_par
             return mock_stream(), "", [], current_part_ids, make_debug_info([])
         else:
             # Tien xu ly cau hoi bang underthesea de match voi du lieu BM25
-            tokenized_question = tokenize_cached(user_question)
+            tokenized_question = tokenize_cached(effective_question)
             query_to_search = tokenized_question
  
             # HyDE (Hypothetical Document Embeddings) Trigger
             if len(tokenized_question.split()) < 25 and not new_part_ids:
                 logger.info("Cau hoi ngan VA khong co ma ban ve, kich hoat HyDE de mo rong ngu canh...")
                 try:
-                    hyde_prompt = f"Viet mot doan van ban ngan gon (1-2 cau) tra loi cho cau hoi sau dua tren tai lieu noi bo: '{user_question}'"
+                    hyde_prompt = f"Viet mot doan van ban ngan gon (1-2 cau) tra loi cho cau hoi sau dua tren tai lieu noi bo: '{effective_question}'"
                     t_hyde = time.time()
                     hyde_response = cohere_invoke([HumanMessage(content=hyde_prompt)]).content
                     query_to_search = tokenize_cached(hyde_response)
@@ -1524,6 +1751,15 @@ def chat_with_rag(user_question, image_path=None, chat_history=None, current_par
                     logger.warning(f"Loi HyDE: {e}")
                     log_trace("hyde", trace_id, used=True, error=str(e))
  
+            # P0-3: mo rong truy van bang glossary/synonym theo domain (tang recall cho phong phi co khi)
+            try:
+                _gloss_add = glossary_expansion_terms(effective_question, user_department)
+                if _gloss_add:
+                    query_to_search = str(query_to_search) + " " + tokenize_cached(_gloss_add)
+                    log_trace("glossary_expansion", trace_id, added=_gloss_add[:200])
+            except Exception as _ge:
+                logger.warning(f"glossary expansion loi: {_ge}")
+
             t_retrieval = time.time()
             retrieval_mode = "unknown"
             if new_part_ids:
@@ -1752,6 +1988,34 @@ def chat_with_rag(user_question, image_path=None, chat_history=None, current_par
  
     if not retrieved_docs and not is_chitchat and not skip_retrieval:
         logger.warning("BLOCKER: Khong tim thay tai lieu nao, chan LLM de tranh hallucination.")
+
+        # P0-2: co the bi chan vi ton tai tai lieu MAT khop pham vi nhung vuot clearance
+        try:
+            _blocked, _needed_lvl = probe_restricted_access(
+                query_to_search, user_department=user_department,
+                allowed_departments=allowed_departments,
+                max_security_level=max_security_level, allowed_sites=allowed_sites)
+        except Exception:
+            _blocked, _needed_lvl = False, None
+        if _blocked and _needed_lvl:
+            _lvl_vi = {"internal": "noi bo (internal)", "confidential": "mat (confidential)"}.get(_needed_lvl, _needed_lvl)
+            _stub_vi = (
+                "Co tai lieu lien quan den cau hoi cua ban, nhung o muc " + _lvl_vi +
+                " ma tai khoan cua ban chua du quyen xem. Noi dung duoc bao mat theo phan quyen.\n\n"
+                "Ban co the vao trang 'Yeu cau quyen' de gui yeu cau cap quyen; quan tri / phu trach phong ban se duyet."
+            )
+            _stub_en = (
+                "There are documents related to your question, but they are classified '" + str(_needed_lvl) +
+                "' and your account is not cleared to view them. The content is protected by access control.\n\n"
+                "You can open the 'Access requests' page to request access; an admin / department owner will review it."
+            )
+            _stub_msg = _stub_en if _normalize_lang(response_language) == "en" else _stub_vi
+            def restricted_stream():
+                yield _stub_msg
+            _dbg = make_debug_info([])
+            _dbg["access_hint"] = {"restricted": True, "needed_level": _needed_lvl, "question": user_question}
+            log_trace("rag_end", trace_id, final_latency_ms=int((time.time() - t_start)*1000), refusal=True, refusal_reason="restricted_by_clearance", needed_level=_needed_lvl)
+            return restricted_stream(), "", [], current_part_ids, _dbg
 
         _empty_vi = (
             "Tài liệu hiện tại chưa có dữ liệu liên quan đến câu hỏi của bạn. "

@@ -252,7 +252,7 @@ def get_all_sessions(username=None, is_admin=False):
         return []
  
 
-def get_chat_history(session_id, username=None, is_admin=False):
+def get_chat_history(session_id, username=None, is_admin=False, user_clearance="confidential"):
     """Lay noi dung mot session chat, chi tra ve cua user hien tai (tru admin)."""
     _ensure_engine()
     try:
@@ -273,6 +273,29 @@ def get_chat_history(session_id, username=None, is_admin=False):
                 """
             )
             rows = conn.execute(query, params).fetchall()
+
+            # P0-2 (bao mat lich su): AN cau tra loi dua tren tai lieu MAT vuot clearance HIEN TAI.
+            # Gate tai thoi diem DOC: sau khi bi thu hoi quyen, user khong the doc lai noi dung mat qua lich su chat.
+            _redact_ids = set()
+            if not is_admin and rows:
+                try:
+                    _order = {"public": 0, "internal": 1, "confidential": 2}
+                    _uorder = _order.get((user_clearance or "public"), 0)
+                    _cids = [int(r[0]) for r in rows if r[0] is not None]
+                    if _cids:
+                        _in = ",".join(str(c) for c in _cids)
+                        _lvl_rows = conn.execute(text(
+                            "SELECT a.ChatID, MAX(CASE t.SecurityLevel WHEN 'confidential' THEN 2 "
+                            "WHEN 'internal' THEN 1 ELSE 0 END) AS lvl "
+                            "FROM AnswerSource a JOIN TaiLieu t ON a.DocID = t.DocID "
+                            f"WHERE a.ChatID IN ({_in}) GROUP BY a.ChatID"
+                        )).fetchall()
+                        for _cid, _lvl in _lvl_rows:
+                            if (_lvl or 0) > _uorder:
+                                _redact_ids.add(_cid)
+                except Exception as _e:
+                    logger.error(f"Loi tinh redaction lich su chat: {_e}", exc_info=True)
+
             history = []
             for row in rows:
                 # FIX C5: doc lai ref_images tu DB (JSON string -> list duong dan)
@@ -281,13 +304,21 @@ def get_chat_history(session_id, username=None, is_admin=False):
                 except (json.JSONDecodeError, TypeError):
                     ref_images = []
                 history.append({"role": "user", "content": row[1], "image": row[3]})
+                _assistant_content = row[2]
+                _assistant_imgs = ref_images
+                if row[0] in _redact_ids:
+                    _assistant_content = (
+                        "🔒 Nội dung câu trả lời này dựa trên tài liệu MẬT mà bạn hiện "
+                        "không còn quyền xem. Nội dung đã được ẩn theo phân quyền."
+                    )
+                    _assistant_imgs = []
                 history.append(
                     {
                         "role": "assistant",
-                        "content": row[2],
+                        "content": _assistant_content,
                         "chat_id": row[0],
                         "danh_gia": row[4],
-                        "ref_images": ref_images,
+                        "ref_images": _assistant_imgs,
                     }
                 )
             return history
@@ -3241,3 +3272,501 @@ def get_common_metadata_for_rag(doc_ids):
     except Exception as e:
         logger.warning(f"get_common_metadata_for_rag loi: {e}")
     return out
+
+
+# ==========================================================================
+# P0-2: ACCESS REQUEST WORKFLOW (yeu cau cap quyen tai lieu mat / phong ban)
+# ==========================================================================
+def create_access_request(user_id, username, request_type, requested_level=None,
+                          requested_dept=None, question_text=None, reason=None):
+    """Tao yeu cau cap quyen. De-dup: neu da co request PENDING trung (cung user +
+    type + level/dept) thi KHONG tao moi. request_type: 'security' | 'department'.
+    Tra ve dict {"request_id": id, "created": bool} hoac None neu loi.
+    """
+    _ensure_engine()
+    try:
+        with engine.begin() as conn:
+            existing = conn.execute(text("""
+                SELECT TOP 1 RequestID FROM dbo.AccessRequests
+                WHERE UserID = :uid AND Status = 'pending' AND RequestType = :rt
+                  AND ISNULL(RequestedLevel, '') = ISNULL(:lvl, '')
+                  AND ISNULL(RequestedDept, '')  = ISNULL(:dept, '')
+            """), {"uid": user_id, "rt": request_type, "lvl": requested_level, "dept": requested_dept}).fetchone()
+            if existing:
+                return {"request_id": existing[0], "created": False}
+            row = conn.execute(text("""
+                INSERT INTO dbo.AccessRequests
+                    (UserID, Username, RequestType, RequestedLevel, RequestedDept, QuestionText, Reason, Status)
+                OUTPUT INSERTED.RequestID
+                VALUES (:uid, :uname, :rt, :lvl, :dept, :q, :reason, 'pending')
+            """), {"uid": user_id, "uname": username, "rt": request_type,
+                    "lvl": requested_level, "dept": requested_dept,
+                    "q": _cap_len(question_text, 4000), "reason": _cap_len(reason, 2000)}).fetchone()
+        rid = row[0] if row else None
+        try:
+            write_audit_log(username=username, action="access_request_create",
+                            entity_type="AccessRequests", entity_id=rid,
+                            details={"request_type": request_type, "level": requested_level, "dept": requested_dept},
+                            user_id=user_id)
+        except Exception:
+            pass
+        return {"request_id": rid, "created": True}
+    except Exception as e:
+        logger.error(f"create_access_request loi: {e}", exc_info=True)
+        return None
+
+
+def list_access_requests(status="pending", limit=200):
+    """Danh sach yeu cau (cho reviewer/admin). status='all' de lay tat ca."""
+    _ensure_engine()
+    try:
+        where = "WHERE Status = :st" if status and status != "all" else ""
+        params = {"st": status} if status and status != "all" else {}
+        with engine.connect() as conn:
+            rows = conn.execute(text(f"""
+                SELECT TOP {int(limit)} RequestID, UserID, Username, RequestType, RequestedLevel,
+                       RequestedDept, QuestionText, Reason, Status, ReviewerUsername, ReviewNote,
+                       ReviewedAt, CreatedAt
+                FROM dbo.AccessRequests {where}
+                ORDER BY CreatedAt DESC
+            """), params).fetchall()
+        cols = ["request_id", "user_id", "username", "request_type", "requested_level",
+                "requested_dept", "question_text", "reason", "status", "reviewer_username",
+                "review_note", "reviewed_at", "created_at"]
+        return [dict(zip(cols, r)) for r in rows]
+    except Exception as e:
+        logger.error(f"list_access_requests loi: {e}", exc_info=True)
+        return []
+
+
+def get_user_access_requests(user_id, limit=50):
+    """Lich su yeu cau cua chinh user."""
+    _ensure_engine()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text(f"""
+                SELECT TOP {int(limit)} RequestID, RequestType, RequestedLevel, RequestedDept,
+                       QuestionText, Status, ReviewerUsername, ReviewNote, ReviewedAt, CreatedAt
+                FROM dbo.AccessRequests WHERE UserID = :uid ORDER BY CreatedAt DESC
+            """), {"uid": user_id}).fetchall()
+        cols = ["request_id", "request_type", "requested_level", "requested_dept", "question_text",
+                "status", "reviewer_username", "review_note", "reviewed_at", "created_at"]
+        return [dict(zip(cols, r)) for r in rows]
+    except Exception as e:
+        logger.error(f"get_user_access_requests loi: {e}", exc_info=True)
+        return []
+
+
+def count_pending_access_requests():
+    _ensure_engine()
+    try:
+        with engine.connect() as conn:
+            return conn.execute(text("SELECT COUNT(*) FROM dbo.AccessRequests WHERE Status = 'pending'")).scalar() or 0
+    except Exception:
+        return 0
+
+
+def resolve_access_request(request_id, decision, reviewer_username, reviewer_id=None, review_note=None):
+    """Duyet/tu choi 1 yeu cau. decision: 'approved' | 'rejected'.
+    Khi approved -> ap quyen: security nang UserSecurityClearance; department them UserDepartments.
+    Ghi audit. Tra ve dict {"ok": bool, "applied": str|None, "message": str}.
+    """
+    _ensure_engine()
+    if decision not in ("approved", "rejected"):
+        return {"ok": False, "message": "decision khong hop le"}
+    target_uname = None
+    applied = None
+    try:
+        with engine.begin() as conn:
+            req = conn.execute(text("""
+                SELECT UserID, Username, RequestType, RequestedLevel, RequestedDept, Status
+                FROM dbo.AccessRequests WHERE RequestID = :rid
+            """), {"rid": request_id}).fetchone()
+            if not req:
+                return {"ok": False, "message": "khong tim thay yeu cau"}
+            if req[5] != "pending":
+                return {"ok": False, "message": "yeu cau da duoc xu ly"}
+            target_uid, target_uname, rtype, rlevel, rdept, _ = req
+
+            if decision == "approved":
+                if rtype == "security" and rlevel in ("public", "internal", "confidential"):
+                    conn.execute(text("""
+                        MERGE dbo.UserSecurityClearance AS tgt
+                        USING (SELECT :uid AS UserID) AS src ON tgt.UserID = src.UserID
+                        WHEN MATCHED AND tgt.MaxLevel <> :lvl THEN UPDATE SET MaxLevel = :lvl
+                        WHEN NOT MATCHED THEN INSERT (UserID, MaxLevel) VALUES (:uid, :lvl);
+                    """), {"uid": target_uid, "lvl": rlevel})
+                    applied = f"clearance={rlevel}"
+                elif rtype == "department" and rdept:
+                    exists = conn.execute(text(
+                        "SELECT 1 FROM dbo.UserDepartments WHERE UserID = :uid AND Department = :d"
+                    ), {"uid": target_uid, "d": rdept}).fetchone()
+                    if not exists:
+                        conn.execute(text(
+                            "INSERT INTO dbo.UserDepartments (UserID, Department) VALUES (:uid, :d)"
+                        ), {"uid": target_uid, "d": rdept})
+                    applied = f"department+{rdept}"
+
+            conn.execute(text("""
+                UPDATE dbo.AccessRequests
+                SET Status = :st, ReviewerID = :rvid, ReviewerUsername = :rvuname,
+                    ReviewNote = :note, ReviewedAt = GETDATE()
+                WHERE RequestID = :rid
+            """), {"st": decision, "rvid": reviewer_id, "rvuname": reviewer_username,
+                    "note": _cap_len(review_note, 2000), "rid": request_id})
+        try:
+            write_audit_log(username=reviewer_username, action=f"access_request_{decision}",
+                            entity_type="AccessRequests", entity_id=request_id,
+                            details={"target_user": target_uname, "applied": applied},
+                            user_id=reviewer_id)
+        except Exception:
+            pass
+        return {"ok": True, "applied": applied, "message": "da xu ly"}
+    except Exception as e:
+        logger.error(f"resolve_access_request loi: {e}", exc_info=True)
+        return {"ok": False, "message": str(e)}
+
+
+# ==========================================================================
+# P0-2 (bo sung): THU HOI / QUAN LY QUYEN + LICH SU CAP QUYEN
+# ==========================================================================
+def list_users_with_access(limit=1000):
+    """Danh sach user kem clearance + phong ban (cho trang thu hoi/quan ly quyen)."""
+    _ensure_engine()
+    try:
+        with engine.connect() as conn:
+            users = conn.execute(text(f"""
+                SELECT TOP {int(limit)} UserID, Username, DisplayName, Department, IsActive
+                FROM dbo.Users ORDER BY Username
+            """)).fetchall()
+            clr = conn.execute(text("SELECT UserID, MaxLevel FROM dbo.UserSecurityClearance")).fetchall()
+            deps = conn.execute(text("SELECT UserID, Department FROM dbo.UserDepartments ORDER BY Department")).fetchall()
+        clr_map = {r[0]: r[1] for r in clr}
+        dep_map = {}
+        for uid, d in deps:
+            dep_map.setdefault(uid, []).append(d)
+        out = []
+        for uid, uname, disp, dept, active in users:
+            out.append({
+                "user_id": uid, "username": uname, "display_name": disp,
+                "department": dept, "is_active": bool(active),
+                "max_level": clr_map.get(uid, "public"),
+                "departments": dep_map.get(uid, []),
+            })
+        return out
+    except Exception as e:
+        logger.error(f"list_users_with_access loi: {e}", exc_info=True)
+        return []
+
+
+def revoke_user_clearance(user_id, new_level, actor_username, actor_id=None, reason=None):
+    """Thu hoi / dieu chinh muc mat cua user ve new_level (public|internal|confidential). Ghi audit."""
+    _ensure_engine()
+    if new_level not in ("public", "internal", "confidential"):
+        return {"ok": False, "message": "muc mat khong hop le"}
+    try:
+        with engine.begin() as conn:
+            old = conn.execute(text("SELECT MaxLevel FROM dbo.UserSecurityClearance WHERE UserID = :uid"),
+                               {"uid": user_id}).fetchone()
+            old_level = old[0] if old else "public"
+            conn.execute(text("""
+                MERGE dbo.UserSecurityClearance AS tgt
+                USING (SELECT :uid AS UserID) AS src ON tgt.UserID = src.UserID
+                WHEN MATCHED THEN UPDATE SET MaxLevel = :lvl
+                WHEN NOT MATCHED THEN INSERT (UserID, MaxLevel) VALUES (:uid, :lvl);
+            """), {"uid": user_id, "lvl": new_level})
+        try:
+            write_audit_log(username=actor_username, action="clearance_revoke",
+                            entity_type="UserSecurityClearance", entity_id=user_id,
+                            details={"from": old_level, "to": new_level, "reason": reason},
+                            user_id=actor_id)
+        except Exception:
+            pass
+        return {"ok": True, "from": old_level, "to": new_level, "message": "da cap nhat"}
+    except Exception as e:
+        logger.error(f"revoke_user_clearance loi: {e}", exc_info=True)
+        return {"ok": False, "message": str(e)}
+
+
+def revoke_user_department(user_id, dept, actor_username, actor_id=None, reason=None):
+    """Thu hoi quyen xem 1 phong ban cua user (xoa ban ghi UserDepartments). Ghi audit."""
+    _ensure_engine()
+    if not dept:
+        return {"ok": False, "message": "thieu phong ban"}
+    try:
+        with engine.begin() as conn:
+            res = conn.execute(text("DELETE FROM dbo.UserDepartments WHERE UserID = :uid AND Department = :d"),
+                               {"uid": user_id, "d": dept})
+        removed = getattr(res, "rowcount", 0) or 0
+        try:
+            write_audit_log(username=actor_username, action="department_revoke",
+                            entity_type="UserDepartments", entity_id=user_id,
+                            details={"department": dept, "removed": removed, "reason": reason},
+                            user_id=actor_id)
+        except Exception:
+            pass
+        return {"ok": True, "removed": removed, "message": "da thu hoi"}
+    except Exception as e:
+        logger.error(f"revoke_user_department loi: {e}", exc_info=True)
+        return {"ok": False, "message": str(e)}
+
+
+def get_grant_history(limit=100):
+    """Lich su cap/thu hoi quyen, doc tu AuditLog (chi cac action lien quan quyen)."""
+    _ensure_engine()
+    actions = (
+        "access_request_create", "access_request_approved", "access_request_rejected",
+        "clearance_revoke", "department_revoke",
+    )
+    try:
+        in_clause = ", ".join("'" + a + "'" for a in actions)
+        with engine.connect() as conn:
+            rows = conn.execute(text(f"""
+                SELECT TOP {int(limit)} CreatedAt, Username, Action, EntityType, EntityID, Details
+                FROM dbo.AuditLog
+                WHERE Action IN ({in_clause})
+                ORDER BY CreatedAt DESC
+            """)).fetchall()
+        cols = ["created_at", "username", "action", "entity_type", "entity_id", "details"]
+        return [dict(zip(cols, r)) for r in rows]
+    except Exception as e:
+        logger.error(f"get_grant_history loi: {e}", exc_info=True)
+        return []
+
+
+# ==========================================================================
+# P0-3: DOMAIN GLOSSARY / SYNONYM (tu dien dong nghia theo domain)
+# ==========================================================================
+def get_active_glossary(domains=None):
+    """Cac muc glossary dang bat. domains=None -> tat ca; nguoc lai loc theo list domain."""
+    _ensure_engine()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT GlossaryID, Domain, Term, Synonyms, Expansion FROM dbo.DomainGlossary WHERE IsActive = 1"
+            )).fetchall()
+        dset = set(domains) if domains else None
+        out = []
+        for gid, domain, term, syn, exp in rows:
+            if dset is not None and domain not in dset:
+                continue
+            try:
+                syn_list = json.loads(syn) if syn else []
+                if not isinstance(syn_list, list):
+                    syn_list = [str(syn_list)]
+            except Exception:
+                syn_list = [s.strip() for s in str(syn or "").split(",") if s.strip()]
+            out.append({"glossary_id": gid, "domain": domain, "term": term,
+                        "synonyms": syn_list, "expansion": exp})
+        return out
+    except Exception as e:
+        logger.error(f"get_active_glossary loi: {e}", exc_info=True)
+        return []
+
+
+def list_domain_glossary(domain=None, active_only=False):
+    _ensure_engine()
+    try:
+        where = []
+        params = {}
+        if domain:
+            where.append("Domain = :d"); params["d"] = domain
+        if active_only:
+            where.append("IsActive = 1")
+        wc = ("WHERE " + " AND ".join(where)) if where else ""
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT GlossaryID, Domain, Term, Synonyms, Expansion, IsActive, CreatedAt "
+                "FROM dbo.DomainGlossary " + wc + " ORDER BY Domain, Term"
+            ), params).fetchall()
+        out = []
+        for gid, dm, term, syn, exp, active, created in rows:
+            try:
+                syn_list = json.loads(syn) if syn else []
+                if not isinstance(syn_list, list):
+                    syn_list = [str(syn_list)]
+            except Exception:
+                syn_list = [s.strip() for s in str(syn or "").split(",") if s.strip()]
+            out.append({"glossary_id": gid, "domain": dm, "term": term, "synonyms": syn_list,
+                        "expansion": exp, "is_active": bool(active), "created_at": created})
+        return out
+    except Exception as e:
+        logger.error(f"list_domain_glossary loi: {e}", exc_info=True)
+        return []
+
+
+def upsert_glossary_term(term, domain, synonyms=None, expansion=None, is_active=True, glossary_id=None):
+    _ensure_engine()
+    if not term or not domain:
+        return {"ok": False, "message": "thieu term hoac domain"}
+    syn_json = json.dumps([s for s in (synonyms or []) if s], ensure_ascii=False)
+    try:
+        with engine.begin() as conn:
+            if glossary_id:
+                conn.execute(text("""
+                    UPDATE dbo.DomainGlossary
+                    SET Term = :t, Domain = :d, Synonyms = :s, Expansion = :e, IsActive = :a, UpdatedAt = GETDATE()
+                    WHERE GlossaryID = :gid
+                """), {"t": _cap_len(term, 255), "d": _cap_len(domain, 50), "s": syn_json,
+                        "e": _cap_len(expansion, 1000), "a": 1 if is_active else 0, "gid": glossary_id})
+                gid = glossary_id
+            else:
+                row = conn.execute(text("""
+                    INSERT INTO dbo.DomainGlossary (Domain, Term, Synonyms, Expansion, IsActive)
+                    OUTPUT INSERTED.GlossaryID
+                    VALUES (:d, :t, :s, :e, :a)
+                """), {"d": _cap_len(domain, 50), "t": _cap_len(term, 255), "s": syn_json,
+                        "e": _cap_len(expansion, 1000), "a": 1 if is_active else 0}).fetchone()
+                gid = row[0] if row else None
+        return {"ok": True, "glossary_id": gid}
+    except Exception as e:
+        logger.error(f"upsert_glossary_term loi: {e}", exc_info=True)
+        return {"ok": False, "message": str(e)}
+
+
+def set_glossary_active(glossary_id, is_active):
+    _ensure_engine()
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE dbo.DomainGlossary SET IsActive = :a, UpdatedAt = GETDATE() WHERE GlossaryID = :gid"),
+                         {"a": 1 if is_active else 0, "gid": glossary_id})
+        return True
+    except Exception as e:
+        logger.error(f"set_glossary_active loi: {e}", exc_info=True)
+        return False
+
+
+def delete_glossary_term(glossary_id):
+    _ensure_engine()
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM dbo.DomainGlossary WHERE GlossaryID = :gid"), {"gid": glossary_id})
+        return True
+    except Exception as e:
+        logger.error(f"delete_glossary_term loi: {e}", exc_info=True)
+        return False
+
+
+# ==========================================================================
+# P1-4: OBSERVABILITY (RagTraceSummary) - luu tong hop + truy van dashboard
+# ==========================================================================
+def _tf(v):
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def save_rag_trace_summary(trace_id, acc):
+    """P1-4: luu 1 dong tong hop tracing vao RagTraceSummary (idempotent theo TraceID)."""
+    _ensure_engine()
+    if not trace_id:
+        return
+    try:
+        with engine.begin() as conn:
+            exists = conn.execute(text("SELECT 1 FROM dbo.RagTraceSummary WHERE TraceID = :tid"),
+                                  {"tid": trace_id[:80]}).fetchone()
+            if exists:
+                return
+            conn.execute(text("""
+                INSERT INTO dbo.RagTraceSummary
+                    (TraceID, Department, Roles, Model, Question, TokensIn, TokensOut, Cost,
+                     FinalLatencyMs, ContextMs, IntentMs, HydeMs, GlossaryMs, RetrievalMs, RerankMs, GateMs, LlmMs,
+                     Refusal, RefusalReason, DocsCount, RetrievalMode)
+                VALUES
+                    (:tid, :dept, :roles, :model, :q, :tin, :tout, :cost,
+                     :flat, :cms, :ims, :hms, :gms, :rms, :rkms, :gtms, :lms,
+                     :refusal, :rreason, :docs, :rmode)
+            """), {
+                "tid": trace_id[:80],
+                "dept": _cap_len(acc.get("department"), 255),
+                "roles": _cap_len(acc.get("roles"), 255),
+                "model": _cap_len(acc.get("model"), 100),
+                "q": _cap_len(acc.get("question"), 500),
+                "tin": _sanitize_int(acc.get("tokens_in")),
+                "tout": _sanitize_int(acc.get("tokens_out")),
+                "cost": _tf(acc.get("cost")),
+                "flat": _sanitize_int(acc.get("final_latency_ms")),
+                "cms": _sanitize_int(acc.get("context_ms")),
+                "ims": _sanitize_int(acc.get("intent_ms")),
+                "hms": _sanitize_int(acc.get("hyde_ms")),
+                "gms": _sanitize_int(acc.get("glossary_ms")),
+                "rms": _sanitize_int(acc.get("retrieval_ms")),
+                "rkms": _sanitize_int(acc.get("rerank_ms")),
+                "gtms": _sanitize_int(acc.get("gate_ms")),
+                "lms": _sanitize_int(acc.get("llm_ms")),
+                "refusal": 1 if acc.get("refusal") else 0,
+                "rreason": _cap_len(acc.get("refusal_reason"), 100),
+                "docs": _sanitize_int(acc.get("docs_count")),
+                "rmode": _cap_len(acc.get("retrieval_mode"), 50),
+            })
+    except Exception as e:
+        logger.error(f"save_rag_trace_summary loi: {e}", exc_info=True)
+
+
+def get_observability(days=30):
+    """P1-4: tong hop cost/token/latency tu RagTraceSummary cho dashboard."""
+    _ensure_engine()
+    out = {"total_requests": 0, "total_cost": 0.0, "avg_latency_ms": 0, "refusal_rate": 0.0,
+           "by_department": [], "daily": [], "step_latency": {}, "refusals": [], "top_costly": []}
+    p = {"d": int(days)}
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT COUNT(*), ISNULL(SUM(Cost),0), ISNULL(AVG(CAST(FinalLatencyMs AS FLOAT)),0),
+                       ISNULL(SUM(CASE WHEN Refusal = 1 THEN 1 ELSE 0 END),0)
+                FROM dbo.RagTraceSummary WHERE CreatedAt >= DATEADD(day, -:d, GETDATE())
+            """), p).fetchone()
+            total = row[0] or 0
+            out["total_requests"] = total
+            out["total_cost"] = round(float(row[1] or 0), 4)
+            out["avg_latency_ms"] = int(row[2] or 0)
+            out["refusal_rate"] = round(float(row[3] or 0) / total * 100, 1) if total else 0.0
+
+            dep = conn.execute(text("""
+                SELECT ISNULL(Department, '(khong ro)'), COUNT(*), ISNULL(SUM(TokensIn),0),
+                       ISNULL(SUM(TokensOut),0), ISNULL(SUM(Cost),0), ISNULL(AVG(CAST(FinalLatencyMs AS FLOAT)),0)
+                FROM dbo.RagTraceSummary WHERE CreatedAt >= DATEADD(day, -:d, GETDATE())
+                GROUP BY Department ORDER BY SUM(Cost) DESC
+            """), p).fetchall()
+            out["by_department"] = [{"department": r[0], "requests": r[1], "tokens_in": int(r[2]),
+                                     "tokens_out": int(r[3]), "cost": round(float(r[4]), 4),
+                                     "avg_latency_ms": int(r[5])} for r in dep]
+
+            daily = conn.execute(text("""
+                SELECT CONVERT(varchar(10), CreatedAt, 23), COUNT(*), ISNULL(SUM(Cost),0)
+                FROM dbo.RagTraceSummary WHERE CreatedAt >= DATEADD(day, -:d, GETDATE())
+                GROUP BY CONVERT(varchar(10), CreatedAt, 23) ORDER BY CONVERT(varchar(10), CreatedAt, 23)
+            """), p).fetchall()
+            out["daily"] = [{"date": r[0], "requests": r[1], "cost": round(float(r[2]), 4)} for r in daily]
+
+            s = conn.execute(text("""
+                SELECT ISNULL(AVG(CAST(ContextMs AS FLOAT)),0), ISNULL(AVG(CAST(IntentMs AS FLOAT)),0),
+                       ISNULL(AVG(CAST(HydeMs AS FLOAT)),0), ISNULL(AVG(CAST(GlossaryMs AS FLOAT)),0),
+                       ISNULL(AVG(CAST(RetrievalMs AS FLOAT)),0), ISNULL(AVG(CAST(RerankMs AS FLOAT)),0),
+                       ISNULL(AVG(CAST(GateMs AS FLOAT)),0), ISNULL(AVG(CAST(LlmMs AS FLOAT)),0)
+                FROM dbo.RagTraceSummary WHERE CreatedAt >= DATEADD(day, -:d, GETDATE())
+            """), p).fetchone()
+            out["step_latency"] = {"context": int(s[0]), "intent": int(s[1]), "hyde": int(s[2]),
+                                   "glossary": int(s[3]), "retrieval": int(s[4]), "rerank": int(s[5]),
+                                   "gate": int(s[6]), "llm": int(s[7])}
+
+            ref = conn.execute(text("""
+                SELECT ISNULL(RefusalReason, '(khac)'), COUNT(*)
+                FROM dbo.RagTraceSummary WHERE Refusal = 1 AND CreatedAt >= DATEADD(day, -:d, GETDATE())
+                GROUP BY RefusalReason ORDER BY COUNT(*) DESC
+            """), p).fetchall()
+            out["refusals"] = [{"reason": r[0], "count": r[1]} for r in ref]
+
+            top = conn.execute(text("""
+                SELECT TOP 20 ISNULL(Question,''), ISNULL(Department,''), ISNULL(Cost,0),
+                       ISNULL(TokensIn,0), ISNULL(TokensOut,0)
+                FROM dbo.RagTraceSummary WHERE CreatedAt >= DATEADD(day, -:d, GETDATE())
+                ORDER BY Cost DESC
+            """), p).fetchall()
+            out["top_costly"] = [{"question": r[0], "department": r[1], "cost": round(float(r[2]), 6),
+                                  "tokens_in": int(r[3]), "tokens_out": int(r[4])} for r in top]
+        return out
+    except Exception as e:
+        logger.error(f"get_observability loi: {e}", exc_info=True)
+        return out

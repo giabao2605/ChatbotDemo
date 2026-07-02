@@ -35,6 +35,7 @@ PAGES = [
     {"key": "dashboard", "label": "Tổng quan", "roles": ["admin"]},
     {"key": "chatbot", "label": "Chatbot hỏi đáp", "roles": ["viewer", "uploader", "reviewer", "admin"]},
     {"key": "help", "label": "Hướng dẫn", "roles": ["viewer", "uploader", "reviewer", "admin"]},
+    {"key": "access", "label": "Yêu cầu quyền", "roles": ["viewer", "uploader", "reviewer", "admin"]},
     {"key": "upload", "label": "Tải tài liệu", "roles": ["uploader", "admin"]},
     {"key": "queue", "label": "Tiến trình ingest", "roles": ["uploader", "admin"]},
     {"key": "review", "label": "Duyệt tài liệu", "roles": ["reviewer", "admin"]},
@@ -42,7 +43,9 @@ PAGES = [
     {"key": "feedback", "label": "Feedback Loop", "roles": ["reviewer", "admin"]},
     {"key": "users", "label": "Người dùng", "roles": ["admin"]},
     {"key": "materials", "label": "Từ điển vật tư", "roles": ["admin"]},
+    {"key": "glossary", "label": "Tu dien dong nghia", "roles": ["admin"]},
     {"key": "analytics", "label": "Báo cáo sử dụng", "roles": ["admin"]},
+    {"key": "observability", "label": "Observability", "roles": ["admin"]},
     {"key": "audit", "label": "Audit Log", "roles": ["admin"]},
     {"key": "settings", "label": "Cấu hình", "roles": ["admin"]},
 ]
@@ -109,6 +112,9 @@ elif page == "chatbot":
 elif page == "help":
     from mech_chatbot.ui.pages import help as app_help
     app_help.run_help()
+elif page == "access":
+    from mech_chatbot.ui.pages import access as app_access
+    app_access.run_access()
 elif page == "upload":
     from mech_chatbot.ui.pages import upload as app_upload
     app_upload.run_upload()
@@ -130,9 +136,15 @@ elif page == "users":
 elif page == "materials":
     from mech_chatbot.ui.pages import materials as app_materials
     app_materials.run_materials()
+elif page == "glossary":
+    from mech_chatbot.ui.pages import glossary as app_glossary
+    app_glossary.run_glossary()
 elif page == "analytics":
     from mech_chatbot.ui.pages import analytics as app_analytics
     app_analytics.run_analytics()
+elif page == "observability":
+    from mech_chatbot.ui.pages import observability as app_observability
+    app_observability.run_observability()
 elif page == "audit":
     from mech_chatbot.ui.pages import audit as app_audit
     app_audit.run_audit()

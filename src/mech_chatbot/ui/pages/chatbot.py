@@ -344,7 +344,7 @@ def run_chat():
                 with col1:
                     if st.button(label, key=f"btn_chat_{s['session_id']}", use_container_width=True, type=btn_type):
                         st.session_state.session_id = s['session_id']
-                        st.session_state.chat_history = get_chat_history(s['session_id'], username=current_user["username"], is_admin=is_admin)
+                        st.session_state.chat_history = get_chat_history(s['session_id'], username=current_user["username"], is_admin=is_admin, user_clearance=current_user.get("max_security_level", "public"))
                         st.rerun()
                 with col2:
                     if st.button("X", key=f"btn_del_{s['session_id']}", help=t("Xóa cuộc trò chuyện"), use_container_width=True):
@@ -692,6 +692,30 @@ def run_chat():
 
                     # C9: hien thi nguon trich dan ngay duoi cau tra loi (trong bong chat assistant)
                     _render_answer_sources(debug_info)
+
+                    # P0-2: cau tra loi bi chan vi tai lieu mat -> tu dong ghi nhan yeu cau cap quyen (deduped)
+                    try:
+                        _hint = debug_info.get("access_hint") if isinstance(debug_info, dict) else None
+                    except Exception:
+                        _hint = None
+                    if _hint and _hint.get("restricted") and "admin" not in (current_user.get("roles") or []):
+                        _needed = _hint.get("needed_level", "confidential")
+                        try:
+                            from mech_chatbot.db.repository import create_access_request
+                            _acc = create_access_request(
+                                user_id=current_user.get("user_id"),
+                                username=current_user.get("username"),
+                                request_type="security",
+                                requested_level=_needed,
+                                question_text=prompt,
+                                reason="Tu dong tao khi cau hoi bi chan vi tai lieu mat",
+                            )
+                        except Exception:
+                            _acc = None
+                        if _acc and _acc.get("created"):
+                            st.info("🔒 " + t("Đã ghi nhận yêu cầu cấp quyền mức: ") + str(_needed) + ". " + t("Xem trạng thái ở trang 'Yêu cầu quyền'."))
+                        else:
+                            st.info("🔒 " + t("Bạn đã có yêu cầu cấp quyền đang chờ duyệt. Xem ở trang 'Yêu cầu quyền'."))
  
             chat_id = save_chat_history(
                 session_id=st.session_state.session_id,

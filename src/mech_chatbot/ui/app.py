@@ -44,6 +44,7 @@ PAGES = [
     {"key": "users", "label": "Người dùng", "roles": ["admin"]},
     {"key": "materials", "label": "Từ điển vật tư", "roles": ["admin"]},
     {"key": "glossary", "label": "Tu dien dong nghia", "roles": ["admin"]},
+    {"key": "lifecycle", "label": "Vong doi tai lieu", "roles": ["reviewer", "admin"]},
     {"key": "analytics", "label": "Báo cáo sử dụng", "roles": ["admin"]},
     {"key": "observability", "label": "Observability", "roles": ["admin"]},
     {"key": "audit", "label": "Audit Log", "roles": ["admin"]},
@@ -139,6 +140,9 @@ elif page == "materials":
 elif page == "glossary":
     from mech_chatbot.ui.pages import glossary as app_glossary
     app_glossary.run_glossary()
+elif page == "lifecycle":
+    from mech_chatbot.ui.pages import lifecycle as app_lifecycle
+    app_lifecycle.run_lifecycle()
 elif page == "analytics":
     from mech_chatbot.ui.pages import analytics as app_analytics
     app_analytics.run_analytics()

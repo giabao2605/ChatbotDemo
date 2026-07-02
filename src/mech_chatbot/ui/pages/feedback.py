@@ -7,6 +7,7 @@ from mech_chatbot.db.repository import (
     recompute_doc_quality_scores,
     get_doc_quality_ranking,
     add_regression_question,
+    ensure_regression_question,
     list_regression_questions,
     set_regression_question_active,
     get_regression_runs,
@@ -166,7 +167,7 @@ def render_feedback_item(fb):
             index=FAILURE_TYPES.index(failure_type) if failure_type in FAILURE_TYPES else 0,
             key=f"type_{fid}",
         )
-        correct_ans = st.text_area(t("C\u00e2u tr\u1ea3 l\u1eddi \u0111\u00fang"), value=correct_answer or "", key=f"correct_{fid}")
+        correct_ans = st.text_area(t("C\u00e2u tr\u1ea3 l\u1eddi \u0111\u00fang"), value=(correct_answer if (correct_answer and str(correct_answer).strip()) else (bot_answer or "")), key=f"correct_{fid}")
         reviewer_note = st.text_area(t("Ghi ch\u00fa reviewer"), key=f"note_{fid}")
         if st.button(t("L\u01b0u ph\u00e2n lo\u1ea1i"), type="primary", key=f"save_{fid}"):
             with engine.begin() as conn:
@@ -190,6 +191,14 @@ def render_feedback_item(fb):
                     site=(src_row[2] if src_row else None),
                     created_by=(st.session_state.get("username") or "reviewer"),
                     feedback_id=fid,
+                )
+                # P1-6: tu dong nap Golden Answer vao bo regression (dedupe)
+                ensure_regression_question(
+                    question=question,
+                    expected_doc_id=(src_row[0] if src_row else None),
+                    department=(src_row[1] if src_row else None),
+                    site=(src_row[2] if src_row else None),
+                    created_by=(st.session_state.get("username") or "reviewer"),
                 )
                 st.success(t("\u0110\u00e3 c\u1eadp nh\u1eadt feedback v\u00e0 l\u01b0u Golden Answer."))
             else:

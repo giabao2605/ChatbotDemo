@@ -1429,6 +1429,7 @@ def make_debug_info(docs=None):
                 "score": d.metadata.get("relevance_score"),
                 # GD5 muc 3: kem muc mat de tang audit doc tai lieu confidential o tang UI.
                 "security_level": d.metadata.get("security_level"),
+                "text": str(d.metadata.get("noi_dung_goc") or getattr(d, "page_content", "") or "")[:800],
             }
             for d in docs
         ]
